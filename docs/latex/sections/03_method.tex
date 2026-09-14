@@ -1,59 +1,64 @@
 \section{GGPKD: Global Geometry through Local Alignment}
 \label{sec:method}
 
-GGPKD distills an embedding teacher into a smaller student by matching the
-teacher's one-hop $k$NN transition rows. The method has only two
-method-specific hyperparameters: the graph width \texttt{graph\_k} and the
-auxiliary-row weight \texttt{row\_weight}. All other temperatures, weights,
-candidate sets, and supervised rows are derived from the teacher graph. The
-graph and teacher embeddings are cached before training and are not needed at
+GGPKD distills an embedding teacher into a smaller student on neighborhoods
+retrieved once by the frozen base student. The student selects each row's
+columns, while the teacher supplies the cosine targets over those columns. The
+method exposes graph width \texttt{graph\_k}, relational coefficients
+\texttt{r0\_weight}/\texttt{r1\_weight}, and auxiliary-row weight
+\texttt{row\_weight}. These three loss coefficients are independent and applied
+directly, without normalization. All temperatures and targets are
+derived from the cached embeddings. The graph and teacher embeddings are cached before training and are not needed at
 inference.
 
-\subsection{Teacher graph}
+\subsection{Student-selected, teacher-valued graph}
 \label{sec:graph}
 
 Let $\mathcal D=\{x_i\}_{i=1}^{N}$ be the deduplicated training corpus. The
-teacher encodes every text once, and its embeddings are $\ell_2$-normalized so
-that all similarities are cosines. For each node $i$, we retrieve the
-$k=\texttt{graph\_k}$ most similar non-self nodes. If $s_i^{(q)}$ is the
-$q$-th largest retrieved cosine, the row bandwidth is
+teacher and frozen base student each encode every text once, and their embeddings
+are $\ell_2$-normalized. For each node $i$, we retrieve the
+$k=\texttt{graph\_k}$ most similar non-self nodes under the base student,
+forming $\mathcal N_i^S$. If $s_i^{T,(q)}$ is the teacher's $q$-th largest
+corpus cosine, the row bandwidth is
 \begin{equation}
-\tau_i=\frac{s_i^{(1)}-s_i^{(k)}}{\log k}.
+\tau_i=\frac{s_i^{T,(1)}-s_i^{T,(k)}}{\log k}.
 \label{eq:row-bandwidth}
 \end{equation}
-Thus the $k$-th retrieved neighbor is $k$ times less likely than the nearest
-neighbor. Because the bandwidth scales with any affine
+On the teacher's own reference top-$k$, the $k$-th neighbor receives $1/k$ of
+the nearest neighbor's unnormalized weight. The target below is evaluated on
+the student-selected set and need not have that same endpoint ratio. Because
+the bandwidth scales with any affine
 rescaling of the similarities, the resulting softmax row is affine-invariant
 and requires no teacher-specific temperature tuning.
 
-The neighbor set is the retrieved list itself, $\mathcal N_i=\mathrm{top}\text{-}k(i)$:
-we apply no reciprocity filter, so every relation the teacher retrieved for $i$
-is eligible to supervise $i$, and every node has degree exactly $k$. A mutual
+The neighbor set is the student's retrieved list itself,
+$\mathcal N_i^S=\mathrm{top}\text{-}k_S(i)$, and every node has degree exactly
+$k$. Teacher-kNN is retained as a source ablation. A mutual
 filter, which keeps $i\rightarrow j$ only when the two nodes retrieve each
-other, suppresses hubs but discards teacher-selected relations; we report it as
+other, suppresses hubs but discards directed relations; we report it as
 an ablation in Section~\ref{sec:experiments}. The teacher transition row is
 \begin{equation}
 P_i^T(j)
-=\frac{\mathbf 1[j\in\mathcal N_i]\exp(c_{ij}^T/\tau_i)}
-{\sum_{u\in\mathcal N_i}\exp(c_{iu}^T/\tau_i)}.
+=\frac{\mathbf 1[j\in\mathcal N_i^S]\exp(c_{ij}^T/\tau_i)}
+{\sum_{u\in\mathcal N_i^S}\exp(c_{iu}^T/\tau_i)}.
 \label{eq:teacher-transition}
 \end{equation}
-Because no edges are removed, the bandwidth in
-Equation~\eqref{eq:row-bandwidth} is read from the same scores that define the
-row, and from the same number of neighbors for every node.
+The bandwidth in Equation~\eqref{eq:row-bandwidth} is read from a teacher
+reference list of the same fixed width for every node; the target values are
+teacher cosines evaluated on the student-selected columns.
 
 \subsection{Deterministic candidate pool}
 \label{sec:candidates}
 
-The candidate set for anchor $i$ is exactly its neighbor set $\mathcal N_i$.
-Every column the teacher retrieved is supervised and none is discarded, so no
+The candidate set for anchor $i$ is exactly $\mathcal N_i^S$.
+Every column the base student retrieved is supervised and none is discarded, so no
 truncation constant enters the objective and every anchor is scored on the same
 number of columns, $k$. GGPKD draws no hard or random negatives and performs no
 per-epoch sampling: the candidates are a deterministic function of the graph and
 remain fixed throughout training. Within a mini-batch $B$, candidates are
 deduplicated into the shared pool
 \begin{equation}
-\mathcal P_B=\bigcup_{i\in B}\mathcal N_i,
+\mathcal P_B=\bigcup_{i\in B}\mathcal N_i^S,
 \label{eq:shared-pool}
 \end{equation}
 so each distinct candidate text is encoded once.
@@ -69,7 +74,7 @@ same columns and at the same stored bandwidth:
 D_{\mathrm{KL}}\!\left(
 P_i^T
 \,\middle\|\,
-\operatorname{softmax}_{j\in\mathcal N_i}(c_{ij}^S/\tau_i)
+\operatorname{softmax}_{j\in\mathcal N_i^S}(c_{ij}^S/\tau_i)
 \right).
 \label{eq:graph-loss}
 \end{equation}
@@ -88,14 +93,14 @@ D_{\mathrm{KL}}\!\left(
 \right).
 \label{eq:ambient-loss}
 \end{equation}
-The ambient and graph groups receive equal total weight; this balance is fixed,
-not tuned.
+The ambient and graph groups receive explicit, independent non-negative
+coefficients $\lambda_0$ and $\lambda_1$, applied directly.
 
 GGPKD also reuses non-anchor candidates as auxiliary row centers. Let
 $\mathcal J_B=\mathcal P_B\setminus B$ and expose the portion of row $j$ that is
 already present in the shared pool:
 \begin{equation}
-\Omega_j^B=\mathcal N_j\cap\mathcal P_B,
+\Omega_j^B=\mathcal N_j^S\cap\mathcal P_B,
 \qquad
 \mathcal J_B^+=\{j\in\mathcal J_B:|\Omega_j^B|\geq2\}.
 \end{equation}
@@ -119,12 +124,15 @@ already in $\mathcal P_B$.
 The complete objective is
 \begin{equation}
 \mathcal L_{\mathrm{GGPKD}}
-=\underbrace{\mathcal L_{r=0}+\mathcal L_{r=1}}_{\mathcal L_{\mathrm{rel}}}
+=\underbrace{\lambda_0\mathcal L_{r=0}+\lambda_1\mathcal L_{r=1}}_{\mathcal L_{\mathrm{rel}}}
 +\lambda_{\mathrm{row}}\mathcal L_{\mathrm{row}}.
 \label{eq:full-objective}
 \end{equation}
-The defaults are $\texttt{graph\_k}=200$ and
-$\lambda_{\mathrm{row}}=\texttt{row\_weight}=1$. Increasing
+The defaults are $\lambda_0=\lambda_1=0.5$,
+$\texttt{graph\_k}=200$, and
+$\lambda_{\mathrm{row}}=\texttt{row\_weight}=1$. No coefficient is divided by
+the sum of the others: common rescaling of $\lambda_0$ and $\lambda_1$ changes
+their total strength relative to $\lambda_{\mathrm{row}}$. Increasing
 \texttt{graph\_k} changes both neighborhood width and the bandwidth in
 Equation~\eqref{eq:row-bandwidth}; those effects cannot be separated by a
 single-axis sweep.

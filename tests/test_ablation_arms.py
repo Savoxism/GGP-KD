@@ -203,11 +203,52 @@ def test_config_defaults_are_the_unablated_method():
     config = GGPKDConfig()
     assert config.support_policy == "topk"
     assert config.relation_target == "transition"
-    assert GGPKDConfig(relation_target="diffusion").relation_target == (
-        "transition"
-    )
+    assert GGPKDConfig(relation_target="diffusion").relation_target == ("transition")
     assert config.calibration_mode == "pool"
     assert config.knn_mode == "directed"
+    assert config.neighbor_source == "student"
+    assert config.r0_weight == 0.5
+    assert config.r1_weight == 0.5
+
+
+def test_explicit_relational_weights_are_independent_and_reported():
+    data = _criterion_inputs()
+    criterion = GGPKDDistillation(
+        teacher_embeddings=data["teacher"],
+        r0_weight=3.0,
+        r1_weight=1.0,
+        row_weight=0.0,
+        **data["graph"],
+    )
+    loss, metrics = criterion(
+        data["anchor"],
+        data["candidates"],
+        data["probs"],
+        candidate_idx=data["candidate_idx"],
+        anchor_idx=data["anchor_idx"],
+    )
+    assert metrics["r0_weight_effective"] == pytest.approx(3.0)
+    assert metrics["r1_weight_effective"] == pytest.approx(1.0)
+    assert metrics["loss_r0_weighted"] == pytest.approx(3.0 * metrics["loss_amb"])
+    assert metrics["loss_r1_weighted"] == pytest.approx(metrics["loss_nbr"])
+    assert loss.item() == pytest.approx(
+        metrics["loss_r0_weighted"] + metrics["loss_r1_weighted"]
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"r0_weight": -1.0},
+        {"r1_weight": -1.0},
+        {"r0_weight": 0.0, "r1_weight": 0.0, "row_weight": 0.0},
+        {"calibration_mode": "none", "r1_weight": 0.0, "row_weight": 0.0},
+        {"relation_target": "ambient_only", "r0_weight": 0.0, "row_weight": 0.0},
+    ],
+)
+def test_config_rejects_invalid_relational_weights(kwargs):
+    with pytest.raises(ValueError, match="weight"):
+        GGPKDConfig(**kwargs)
 
 
 def test_config_rejects_the_one_impossible_combination():
@@ -225,7 +266,9 @@ def test_config_rejects_the_one_impossible_combination():
 
 
 def test_minimal_relational_objective_is_buildable():
-    config = GGPKDConfig(relation_target="direct", calibration_mode="none", row_weight=0.0)
+    config = GGPKDConfig(
+        relation_target="direct", calibration_mode="none", row_weight=0.0
+    )
     assert config.relation_target == "direct"
     assert config.calibration_mode == "none"
 
@@ -357,11 +400,11 @@ def test_batch_local_rejects_a_batch_too_small_to_have_a_relation():
         collate([dataset[0]])
 
 
-def test_ambient_only_gives_the_ambient_scale_the_whole_weight():
-    """Deleting a group never renormalizes any surviving group.
+def test_relational_weights_are_not_renormalized_when_a_group_is_removed():
+    """Each configured coefficient remains absolute when another group is absent.
 
-    Every top-level coefficient is 1.0, so both `ambient_only` and a normal
-    objective whose graph target is zero equal the calibration KL exactly.
+    ``ambient_only`` retains the default 0.5 coefficient on L_r0. A normal
+    two-group objective whose graph target is empty has that same value.
     """
     data = _criterion_inputs()
     zero_targets = torch.zeros_like(data["probs"])
@@ -378,12 +421,11 @@ def test_ambient_only_gives_the_ambient_scale_the_whole_weight():
         candidate_idx=data["candidate_idx"],
         anchor_idx=data["anchor_idx"],
     )
-    assert loss.item() == pytest.approx(metrics["loss_amb"], rel=1e-5)
+    assert loss.item() == pytest.approx(0.5 * metrics["loss_amb"], rel=1e-5)
     assert metrics["loss_nbr"] == 0.0
     assert metrics["loss_row"] == 0.0
 
-    # The same targets under the normal objective have the same value: the dead
-    # graph group neither contributes nor changes calibration's coefficient.
+    # Removing or emptying the other group does not rescale lambda_0.
     scaled = GGPKDDistillation(
         teacher_embeddings=data["teacher"],
         row_weight=0.0,

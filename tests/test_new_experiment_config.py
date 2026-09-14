@@ -29,6 +29,10 @@ def test_ggpkd_cli_overrides(monkeypatch):
             "ggpkd",
             "--eval_every",
             "0",
+            "--r0_weight",
+            "3",
+            "--r1_weight",
+            "1",
             "--row_weight",
             "0.8",
             "--fixed_bandwidth",
@@ -53,6 +57,8 @@ def test_ggpkd_cli_overrides(monkeypatch):
     args = main.parse_args()
     config = main.get_config(args.method, args)
 
+    assert config.r0_weight == 3.0
+    assert config.r1_weight == 1.0
     assert config.row_weight == 0.8
     # Per-epoch evaluation is off by default: convergence inside the 5-epoch
     # budget is established (plateau from epoch 2 at lr 3e-5), so only the final
@@ -275,7 +281,7 @@ def test_ggpkd_relational_loss_reports_semantic_decomposition():
     assert metrics["loss_amb"] == pytest.approx(metrics["kl_amb"], rel=1e-6)
     assert metrics["loss_nbr"] == pytest.approx(metrics["kl_nbr"], rel=1e-6)
 
-    # Ambient and graph keep the fixed 50/50 split.
+    # Default ambient and graph weights preserve the previous 50/50 split.
     expected_rel = 0.5 * metrics["loss_amb"] + 0.5 * metrics["loss_nbr"]
     assert metrics["loss_rel"] == pytest.approx(expected_rel, rel=1e-6)
     assert loss.item() == pytest.approx(metrics["loss_rel"], rel=1e-6)

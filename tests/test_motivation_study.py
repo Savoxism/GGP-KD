@@ -133,10 +133,6 @@ def test_corpus_uniform_support_size_matches_the_teacher_arm():
     [
         ({"relation_target": "diffusion"}, "relation_target='direct'"),
         ({"relation_target": "direct", "diffusion_quota": None}, "diffusion_quota"),
-        (
-            {"relation_target": "direct", "diffusion_quota": 8, "row_weight": 1.0},
-            "row_weight=0",
-        ),
     ],
 )
 def test_off_graph_policies_refuse_their_broken_configurations(overrides, message):
@@ -144,6 +140,17 @@ def test_off_graph_policies_refuse_their_broken_configurations(overrides, messag
     settings.update(overrides)
     with pytest.raises(ValueError, match=message):
         GGPKDConfig(**settings)
+
+
+def test_off_graph_policy_accepts_the_complete_objective():
+    config = GGPKDConfig(
+        support_policy="corpus_uniform",
+        relation_target="direct",
+        diffusion_quota=8,
+        row_weight=1.0,
+    )
+    assert config.calibration_mode == "pool"
+    assert config.row_weight == 1.0
 
 
 # --------------------------------------------------------------------------- #

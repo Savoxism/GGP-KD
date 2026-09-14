@@ -2,6 +2,12 @@
 
 Two generations live here.
 
+The current staged protocol uses student-kNN by default and keeps the complete
+GGPKD objective active in every comparison arm. Only explicit loss-decomposition
+arms in Stages 1/2D remove or zero a term; Stage 3G keeps all three coefficients
+strictly positive. The minimal objective described under E1--E4 below is historical
+and must not be used as evidence for the current paper.
+
 ## The staged sweeps (current — `experiments.md`)
 
 One script per stage, run in order. The orchestrator stops after Stage 0 on
@@ -11,26 +17,39 @@ and no script may guess it.
 ```bash
 GPUS=0,1,2,3            bash scripts/exp/run_all.sh   # Stage 0, then stop
 column -s, -t runs/stage0_graph_k/results.csv | less -S
-GRAPH_K=<winner> GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Stages 1-3
+GRAPH_K=<winner> GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Stages 1-3G
 DRY_RUN=1 GRAPH_K=50    bash scripts/exp/run_all.sh   # print the plan only
 ```
 
 | stage | script | question | runs |
 |---|---|---|---|
 | 0 | `stage0_graph_k.sh` | what operating point? also the full-model reference | 12 |
-| 1 | `stage1_deletions.sh` | does each component earn its place? | 12 |
+| 1 | `stage1_deletions.sh` | does each component earn its place? | 15 |
 | 2B | `stage2b_ladder.sh` | which texts should an anchor be compared against? | 12/pair |
 | 2C | `stage2c_dose_response.sh` | does the score follow the count when batch composition supplies it? | 15 |
-| 2D | `stage2d_components.sh` | ablation on the shipped objective | 9 |
-| 3 | `stage3_main_table.sh` | the deliverable | 6–15 |
+| 2D | `stage2d_components.sh` | ablation on the shipped objective | 12 |
+| 3 | `stage3_main_table.sh` | main-table deliverable | 6 |
+| 3G | `stage3g_lambda_sensitivity.sh` | independent $\lambda_0$, $\lambda_1$, $\lambda_{row}$ sensitivity | 18 |
 
 Two stages need no GPU: **A** is the formula $(B-1)k/(N-1)$ plus one exposure
 curve from `coverage.py`, and **E** scores Stage 2D's checkpoints post-hoc with
 `exp3_heldout_geometry.sh`.
 
-`FROM` / `TO` restrict the range (`0`, `1`, `2b`, `2c`, `2d`, `3`). Everything
+`FROM` / `TO` restrict the range (`0`, `1`, `2b`, `2c`, `2d`, `3`, `3g`). Everything
 else — `GPUS`, `SEEDS`, `PAIR`/`PAIRS`, `CORPUS`, `CACHE_ROOT`, `DRY_RUN` — is
 forwarded to the stage scripts.
+
+Run only the three-lambda sensitivity matrix with:
+
+```bash
+GRAPH_K=<winner> GPUS=0,1,2,3 SEEDS=42,43,44 \
+  bash scripts/exp/stage3g_lambda_sensitivity.sh
+```
+
+Its default six arms halve and double one coefficient at a time around
+`(r0_weight, r1_weight, row_weight) = (0.5, 0.5, 1.0)`. Override the tested
+points with `LAMBDA0_VALUES`, `LAMBDA1_VALUES`, and `LAMBDA_ROW_VALUES`; values
+must stay strictly positive so the study remains full-loss.
 
 ### Re-running part of a stage
 
@@ -88,7 +107,8 @@ Each script's header documents its own.
 
 ## The shared harness
 
-Every relational arm in E1, E2 and E4 trains the **same minimal objective**:
+Every relational arm in the superseded E1, E2 and E4 study trains the **same
+historical minimal objective**:
 
 ```
 L = (1/|B|) sum_i KL( p_T(. | S_i) || p_S(. | S_i) )
@@ -112,7 +132,7 @@ teacher-support arms use. The older `ambient_only` form of that baseline scores
 at one global temperature, which would have made the arms differ in two things at
 once.
 
-Full GGPKD (`L_{r=0} + L_{r=1} + lambda L_row`) is deliberately **not** used
+Full GGPKD (`lambda0_bar L_{r=0} + lambda1_bar L_{r=1} + lambda L_row`) is deliberately **not** used
 here. If the study's arms carried the ambient scale and the auxiliary rows, no
 reader could tell whether a gain came from support selection or from those.
 

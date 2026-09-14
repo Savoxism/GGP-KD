@@ -1,6 +1,6 @@
 """The fixes behind the 2026-09-12 sweep's broken tables.
 
-* student_knn trained on the teacher graph, rebuilt under the student's name;
+* student_knn once trained on a teacher graph rebuilt under the student's name;
 * pair_order read exactly 1.0 or 0.0 on a rectangular, sparse held-out mask;
 * Stage 1.1b and 1.3 had no code;
 * the runner overwrote multi-pair CSVs and could not re-run a single arm.
@@ -173,17 +173,15 @@ def test_random_row_centers_move_only_the_row_term():
 # --------------------------------------------------------------------------- #
 
 
-def test_student_neighbours_require_teacher_targets_and_no_row_term():
-    GGPKDConfig(
-        neighbor_source="student",
-        relation_target="direct",
-        calibration_mode="none",
-        row_weight=0.0,
-    )
-    with pytest.raises(ValueError, match="relation_target='direct'"):
-        GGPKDConfig(neighbor_source="student", row_weight=0.0)
-    with pytest.raises(ValueError, match="row_weight=0"):
-        GGPKDConfig(neighbor_source="student", relation_target="direct")
+def test_student_neighbours_are_the_full_objective_default():
+    config = GGPKDConfig()
+    assert config.neighbor_source == "student"
+    assert config.relation_target == "transition"
+    assert config.calibration_mode == "pool"
+    assert config.row_weight == 1.0
+
+    # Teacher-kNN remains a one-flag ablation.
+    assert GGPKDConfig(neighbor_source="teacher").neighbor_source == "teacher"
 
 
 def test_random_row_centers_are_refused_without_the_row_term():
@@ -226,6 +224,20 @@ def test_student_graph_takes_columns_from_the_student_and_temperatures_from_the_
         _sorted_neighbours(student_graph), _sorted_neighbours(teacher_graph)
     )
     torch.testing.assert_close(student_graph["row_temps"], teacher_graph["row_temps"])
+
+    # The student selects columns; the teacher supplies every target value.
+    teacher_norm = F.normalize(teacher, dim=-1)
+    selected = student_graph["transition_neighbors"]
+    selected_embeddings = teacher_norm[selected]
+    teacher_scores = torch.einsum(
+        "nd,nkd->nk", teacher_norm, selected_embeddings
+    )
+    expected_probs = torch.softmax(
+        teacher_scores / student_graph["row_temps"].unsqueeze(1), dim=-1
+    )
+    torch.testing.assert_close(
+        student_graph["transition_probs"], expected_probs, rtol=1e-5, atol=1e-6
+    )
 
 
 def test_a_teacher_graph_never_loads_under_the_student_name(tmp_path):
@@ -395,14 +407,25 @@ def test_runner_rejects_an_arm_the_sweep_does_not_define():
         (
             "stage1_deletions.sh",
             {},
-            ["runs:   4", "row_centers_random", "uniform_target"],
+            ["runs:   5", "no_r0", "no_r1", "row_centers_random", "uniform_target"],
             ["skipping arm"],
         ),
         (
             "stage2b_ladder.sh",
             {},
-            ["runs:   4", "graph=student_knn"],
-            ["qwen3_4b_to_bert_base"],
+            [
+                "runs:   4",
+                "graph=student_knn",
+                "objective: full (r=0 + r=1 + row)",
+                "student_knn                        graph=student_knn",
+                "teacher_knn                        graph=teacher_knn",
+            ],
+            [
+                "qwen3_4b_to_bert_base",
+                "--row_weight 0",
+                "--no_ambient",
+                "--calibration_mode none",
+            ],
         ),
         (
             "stage2c_dose_response.sh",
@@ -417,6 +440,21 @@ def test_runner_rejects_an_arm_the_sweep_does_not_define():
             [],
         ),
         ("stage3_main_table.sh", {}, ["pairs run here: none"], ["main table -- pair"]),
+        (
+            "stage3g_lambda_sensitivity.sh",
+            {},
+            [
+                "runs:   6",
+                "lambda0_0p25",
+                "--r0_weight 0.25 --r1_weight 0.5 --row_weight 1.0",
+                "lambda1_1p0",
+                "--r0_weight 0.5 --r1_weight 1.0 --row_weight 1.0",
+                "lambda_row_2p0",
+                "--r0_weight 0.5 --r1_weight 0.5 --row_weight 2.0",
+                "all three loss groups remain active",
+            ],
+            ["--r0_weight 0 --", "--r1_weight 0 --", "--row_weight 0\n"],
+        ),
     ],
 )
 def test_stage_dry_runs_plan_the_fixed_matrix(script, extra_env, expected, absent):
@@ -443,3 +481,32 @@ def test_stage_dry_runs_plan_the_fixed_matrix(script, extra_env, expected, absen
         assert text in output
     for text in absent:
         assert text not in output
+
+
+def test_lambda_sensitivity_rejects_a_zero_weight():
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "GPUS": "0",
+        "GRAPH_K": "200",
+        "PYTHON_BIN": str(PYTHON_BIN),
+        "LAMBDA0_VALUES": "0",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(
+                REPO_ROOT
+                / "scripts"
+                / "exp"
+                / "stage3g_lambda_sensitivity.sh"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "zero belongs to loss decomposition" in result.stderr

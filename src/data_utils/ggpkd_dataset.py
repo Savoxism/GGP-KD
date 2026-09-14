@@ -16,7 +16,7 @@ class TextPairWithTeacherAndGGPKD(Dataset):
     """GGPKD anchors with a candidate set redrawn every epoch.
 
     `anchor_texts` is passed in explicitly rather than re-derived from the frame:
-    the teacher graph is built over exactly these strings, and silently pulling a
+    the cached graph is built over exactly these strings, and silently pulling a
     different column here (e.g. `premise` when the teacher encoded `text`) would
     misalign every node in the graph without raising anything.
     """

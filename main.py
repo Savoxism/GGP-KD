@@ -64,6 +64,18 @@ def parse_args():
         "bandwidth derived from graph_k",
     )
     parser.add_argument("--truncation_tolerance", type=float, default=None)
+    parser.add_argument(
+        "--r0_weight",
+        type=float,
+        default=None,
+        help="Independent coefficient of the ambient/calibration loss L_r0",
+    )
+    parser.add_argument(
+        "--r1_weight",
+        type=float,
+        default=None,
+        help="Independent coefficient of the graph-transition loss L_r1",
+    )
     parser.add_argument("--row_weight", type=float, default=None)
     parser.add_argument("--diffusion_quota", type=int, default=None)
     # Ablation switches. Each defaults to the method's value,
@@ -83,13 +95,13 @@ def parse_args():
         "local_topk (r=1-only support), corpus_uniform (columns drawn from the "
         "whole corpus) or rewired (degree-matched rewiring). The last two leave "
         "the graph, so they require --relation_target direct, an explicit "
-        "--diffusion_quota and --row_weight 0",
+        "--diffusion_quota, and read L_row targets from the teacher-valued graph",
     )
     parser.add_argument(
         "--relation_target",
         choices=["transition", "diffusion", "direct", "ambient_only", "uniform"],
         default=None,
-        help="Target on the selected columns: diffusion (method), direct teacher "
+        help="Target on the selected columns: transition (method), direct teacher "
         "cosine, ambient_only (no graph relations at all), or uniform (equal mass "
         "on every retrieved neighbour, same columns and tau_i)",
     )
@@ -97,21 +109,21 @@ def parse_args():
         "--knn_mode",
         choices=["mutual", "directed", "symmetrized"],
         default=None,
-        help="kNN edge rule for the teacher graph: directed (method), mutual, symmetrized",
+        help="kNN edge rule for the cached graph: directed (method), mutual, symmetrized",
     )
     parser.add_argument(
         "--neighbor_source",
         choices=["teacher", "student"],
         default=None,
-        help="Whose kNN decides each row's columns: teacher (method) or the base "
-        "student. Row temperatures stay the teacher's; student requires "
-        "--relation_target direct and --row_weight 0",
+        help="Whose kNN decides each row's columns: the frozen base student "
+        "(method) or the teacher (ablation). The teacher supplies target cosines, "
+        "transition probabilities and row temperatures in both cases",
     )
     parser.add_argument(
         "--row_centers",
         choices=["teacher", "random"],
         default=None,
-        help="Columns L_row scores each extra anchor against: the teacher's "
+        help="Columns L_row scores each extra anchor against: its cached graph "
         "neighbours in the pool (method) or as many random pool columns",
     )
     parser.add_argument(
@@ -120,7 +132,7 @@ def parse_args():
         help="Batch-local relational KD baseline: relations among the batch only, "
         "no graph and no candidate draw. Defaults to --relation_target "
         "ambient_only; pass --relation_target direct for the arm that is "
-        "temperature-matched to the teacher-support arms (per-anchor tau_i)",
+        "temperature-matched to the graph-support arms (per-anchor tau_i)",
     )
     parser.add_argument(
         "--no_ambient",
@@ -145,7 +157,7 @@ def parse_args():
         "--holdout_edge_frac",
         type=float,
         default=None,
-        help="Fraction of teacher graph edges withheld from every training "
+        help="Fraction of cached graph edges withheld from every training "
         "support (E3). The withheld edges are stored in the artifact for the "
         "post-hoc held-out geometry evaluation; 0 is the method",
     )
@@ -266,6 +278,8 @@ def get_config(method: str, args):
     ggpkd_overrides = (
         "graph_k",
         "truncation_tolerance",
+        "r0_weight",
+        "r1_weight",
         "row_weight",
         "diffusion_quota",
         "hard_neg_k",

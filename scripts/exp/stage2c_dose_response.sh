@@ -2,9 +2,10 @@
 # Stage 2C of experiments.md -- dose-response on the count. 15 runs.
 #
 # A gives the count analytically, B gives the outcome. C raises the count for a
-# batch-local objective by composing batches from one teacher neighbourhood and
+# batch-local objective by composing batches from one graph neighbourhood and
 # checks the score follows. pointwise / in_batch / full GGPKD, samplers random and
-# teacher_neighbor. `full @ random` is Stage 0's winner and is not repeated.
+# `teacher_neighbor` (legacy CLI name). `full @ random` is Stage 0's winner and
+# is not repeated.
 #
 # The batch-size half (C.2) was cut: no single setting matches optimizer steps,
 # passes over the data and learning rate across B at once, so it cannot isolate

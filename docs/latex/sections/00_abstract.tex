@@ -3,24 +3,24 @@ A text embedding teacher stores knowledge in the geometry it induces over an
 entire corpus, but supervising all pairwise relations is infeasible. Standard
 relational knowledge distillation (KD) instead forms its supervision support
 from examples that happen to co-occur in a mini-batch, so relation exposure is
-independent of teacher relevance: an important teacher relation and an
-unrelated corpus pair are equally likely to be supervised. We argue that a
+independent of semantic relatedness: a related pair and an unrelated corpus
+pair are equally likely to be supervised. We argue that a
 corpus-level relational objective should separate two decisions that mini-batch
 KD conflates---which relations are \emph{eligible} for supervision, and how
 eligible relations are \emph{realized} efficiently---and that preserving global
 geometry depends on both alignment, reproducing the supervised relations
 accurately, and coverage, supervising most of the relational mass the teacher
 considers important. We introduce \textbf{Global Geometry Preservation
-Knowledge Distillation (GGPKD)}, which lets teacher geometry choose the support
-and uses mini-batches only to realize it. GGPKD encodes the corpus once with
-the teacher, builds a $k$-nearest-neighbor graph whose per-row bandwidth is
-read off the retrieved similarities, and supervises each anchor on its own
-retrieved neighborhood, every column included. The deduplicated candidate pool of a batch is encoded
+Knowledge Distillation (GGPKD)}, which freezes the base student's $k$NN
+shortlists, asks the teacher to value the selected relations, and uses
+mini-batches only to realize them. GGPKD encodes the corpus once with the
+teacher and base student, then forms teacher-valued transition targets on the
+student-selected columns. The deduplicated candidate pool of a batch is encoded
 once and reused twice more: to calibrate similarity levels across the batch,
-and to supervise additional teacher-selected rows without any extra student
-encoding. Supports, bandwidths, temperatures, and term weights are all derived
-from the graph, leaving two hyperparameters: the graph width and the
-auxiliary-row weight. Across nine standard sentence-embedding benchmarks and
+and to supervise additional graph-selected rows without any extra student
+encoding. Independent coefficients weight the ambient and graph relational
+groups directly, alongside the graph width and auxiliary-row coefficient.
+Across nine standard sentence-embedding benchmarks and
 three teacher--student settings, GGPKD obtains the best mean score in every
 setting, with the largest and most consistent gains on semantic textual
 similarity. GGPKD requires no task labels and no online teacher inference, and

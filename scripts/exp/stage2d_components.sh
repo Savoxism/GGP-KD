@@ -50,7 +50,7 @@ mutual_holdout|$CORPUS|$(method_graph_flags) --knn_mode mutual $HOLDOUT_FLAGS
 truncated_holdout|$CORPUS|$(method_graph_flags) --truncation_tolerance 0.01 $HOLDOUT_FLAGS"
 
 ARMS_SPEC="full|main_holdout|ggpkd|
-no_both|main_holdout|ggpkd|--row_weight 0 --calibration_mode none
+no_both|main_holdout|ggpkd|--row_weight 0 --r0_weight 0
 knn_mutual|mutual_holdout|ggpkd|
 truncated|truncated_holdout|ggpkd|
 "
@@ -61,7 +61,7 @@ export GRAPH_SPEC ARMS_SPEC CSV_OUT
 
 echo "Stage 2D: component ablation at graph_k=$GRAPH_K"
 if [[ -n "$HOLDOUT_FLAGS" ]]; then
-    note "withholding $HOLDOUT_FRAC of the teacher's pairs so Stage 2E can score"
+    note "withholding $HOLDOUT_FRAC of the cached graph edges so Stage 2E can score"
     note "these checkpoints; absolute numbers therefore do not line up with the"
     note "main table -- the comparison that matters is between these arms"
 else

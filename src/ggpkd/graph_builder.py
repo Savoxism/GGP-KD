@@ -22,7 +22,11 @@ from .policy import (
 # 10: multi-hop diffusion removed. The method supervises one hop, so a pool IS a
 #    transition row; `diffusion_scales` and `scale_weights` have left the metadata
 #    and every cache written under them is rejected.
-ARTIFACT_VERSION = 10
+# 11: non-teacher neighbour sources select columns only. Transition scores,
+#     probabilities and row bandwidths are all read from the teacher, which makes
+#     the student-kNN graph usable by the complete objective rather than only by
+#     the direct-target/no-row control.
+ARTIFACT_VERSION = 11
 
 # Anchors per block in `_target_sharpness_stats`. Pure memory control: the stats
 # are per-anchor reductions, so the block size cannot change any reported number.
@@ -205,6 +209,74 @@ def _compute_topk_cosine(
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
 
 
+def _cosine_scores_at_indices(
+    embeddings: torch.Tensor,
+    indices: np.ndarray,
+    chunk_size: int = 128,
+    candidate_chunk_size: int = 32,
+    device: torch.device | None = None,
+) -> np.ndarray:
+    """Teacher cosines for a preselected ``[N, K]`` neighbour table.
+
+    Another encoder may decide which columns belong to a row, but every GGPKD
+    target remains a teacher target. Computing only these N*K pairs avoids a
+    second dense N-by-N matrix. Candidate columns are also chunked so a large
+    teacher dimension does not materialize ``chunk_size * K * d`` at once.
+    """
+    if indices.ndim != 2:
+        raise ValueError(f"indices must be [N, K], got shape={indices.shape}")
+    if int(embeddings.size(0)) != int(indices.shape[0]):
+        raise ValueError(
+            f"indices have {indices.shape[0]} rows but embeddings have "
+            f"{int(embeddings.size(0))}"
+        )
+    if indices.size and (indices.min() < 0 or indices.max() >= embeddings.size(0)):
+        raise ValueError("indices contain an out-of-range corpus node")
+    if device is None:
+        device = (
+            torch.device("cuda") if torch.cuda.is_available() else embeddings.device
+        )
+
+    def _run(target: torch.device) -> np.ndarray:
+        normalized = F.normalize(embeddings.float(), p=2, dim=-1).to(target)
+        index_tensor = torch.from_numpy(indices.astype(np.int64, copy=False)).to(target)
+        output = np.empty(indices.shape, dtype=np.float32)
+        for start in tqdm(
+            range(0, indices.shape[0], chunk_size),
+            desc="GGPKD teacher scores on selected kNN",
+        ):
+            end = min(start + chunk_size, indices.shape[0])
+            anchors = normalized[start:end]
+            block_indices = index_tensor[start:end]
+            block_scores = torch.empty(
+                (end - start, indices.shape[1]),
+                dtype=normalized.dtype,
+                device=target,
+            )
+            for col_start in range(0, indices.shape[1], candidate_chunk_size):
+                col_end = min(col_start + candidate_chunk_size, indices.shape[1])
+                candidates = normalized[block_indices[:, col_start:col_end]]
+                block_scores[:, col_start:col_end] = torch.einsum(
+                    "bd,bkd->bk", anchors, candidates
+                )
+            output[start:end] = block_scores.cpu().numpy().astype(np.float32)
+        return output
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        return _run(device)
+    except torch.cuda.OutOfMemoryError:
+        print(
+            "GGPKD selected-pair cosine: out of memory on "
+            f"{device}, falling back to CPU"
+        )
+        torch.cuda.empty_cache()
+        return _run(torch.device("cpu"))
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 KNN_MODES = ("mutual", "directed", "symmetrized")
 # Whose kNN decides a row's columns. `student` is the ladder's student_knn arm.
 NEIGHBOR_SOURCES = ("teacher", "student")
@@ -236,6 +308,7 @@ def _build_transition(
     knn_mode: str = "directed",
     holdout_edge_frac: float = 0.0,
     holdout_seed: int = 0,
+    row_temps_override: np.ndarray | None = None,
 ) -> tuple[
     list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray, dict
 ]:
@@ -247,17 +320,18 @@ def _build_transition(
 
     * ``directed`` (canonical): keep all of topk(i). Every node has degree
       graph_k, hubs keep every edge pointing at them, and a row is supervised on
-      exactly the relations the teacher retrieved for it.
+      exactly the relations the configured neighbour source retrieved for it.
     * ``mutual``: keep j iff j in topk(i) *and* i in topk(j). A hub that
       everything retrieves but that retrieves nothing back loses those edges.
       This was the earlier default; it suppresses hubness but discards teacher
-      mass, and E2 measured it 0.36 points below ``directed``.
+      edges, and E2 measured it 0.36 points below ``directed`` on the old graph.
     * ``symmetrized``: keep the union, j in topk(i) *or* i in topk(j). Degrees are
       the largest of the three and hubs are amplified rather than suppressed.
 
     Bandwidth is read off the retrieval width by `_knn_bandwidths`, so the graph
-    is invariant to the teacher's similarity scale and `graph_k` is the only
-    quantity that sets it. With `fixed_bandwidth=True` every row uses `graph_temp`
+    makes the teacher-valued targets invariant to the teacher's similarity scale,
+    and `graph_k` is the only quantity that sets it. With
+    `fixed_bandwidth=True` every row uses `graph_temp`
     instead, which is the baseline that arm exists to be compared against.
 
     `holdout_edge_frac` withholds a symmetric random subset of the surviving edges
@@ -291,11 +365,19 @@ def _build_transition(
     holdout_starved = 0
     # Bandwidths come from the raw top-k, so they are one vectorised subtraction
     # over the whole corpus rather than a bisection per row.
-    row_temps = (
-        np.full(n_items, float(graph_temp), dtype=np.float64)
-        if fixed_bandwidth
-        else _knn_bandwidths(top_scores, graph_k)
-    )
+    if fixed_bandwidth:
+        row_temps = np.full(n_items, float(graph_temp), dtype=np.float64)
+    elif row_temps_override is not None:
+        row_temps = np.asarray(row_temps_override, dtype=np.float64).reshape(-1)
+        if row_temps.shape != (n_items,):
+            raise ValueError(
+                f"row_temps_override must have shape ({n_items},), got "
+                f"{row_temps.shape}"
+            )
+        if not np.isfinite(row_temps).all() or (row_temps <= 0).any():
+            raise ValueError("row_temps_override must be finite and positive")
+    else:
+        row_temps = _knn_bandwidths(top_scores, graph_k)
 
     for i in tqdm(range(n_items), desc=f"GGPKD {knn_mode} kNN graph"):
         neighbors = []
@@ -686,10 +768,10 @@ def build_or_load_ggpkd_artifact(
 
     `neighbor_source` other than "teacher" is a label for another encoder whose
     kNN decides each row's columns; `neighbor_embeddings` produces that encoder's
-    corpus embeddings and is only called on a build. The row temperatures stay
-    the teacher's own bandwidths, so the neighbour set is the only thing that
-    differs from the teacher graph. The label is part of the cache key: an
-    artifact built from another encoder must never load under the teacher's name.
+    corpus embeddings and is only called on a build. Scores, transition targets
+    and row temperatures remain the teacher's. The label is part of the cache key:
+    an artifact built from another encoder must never load under the teacher's
+    name.
     """
     n_items = int(teacher_embeddings.size(0))
     # Sized from graph_k only when an arm actually draws hard negatives. The
@@ -754,7 +836,8 @@ def build_or_load_ggpkd_artifact(
     topk_device = (
         torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     )
-    teacher_top_scores = None
+    row_temps_override = None
+    neighbor_row_temp_p50 = None
     if neighbor_source == "teacher":
         top_indices, top_scores = _compute_topk_cosine(
             teacher_embeddings, k=topk_for_graph, device=topk_device
@@ -771,14 +854,26 @@ def build_or_load_ggpkd_artifact(
                 f"neighbor embeddings have {int(neighbor_matrix.size(0))} rows but "
                 f"there are {n_items} teacher embeddings"
             )
-        # Columns and their order come from the other encoder; the teacher's
-        # top-k is read only for its bandwidths.
-        top_indices, top_scores = _compute_topk_cosine(
+        # Columns and their order come from the other encoder. Every value the
+        # loss calls a target still comes from the teacher: teacher cosines are
+        # gathered on those columns, while the teacher's own raw top-k sets the
+        # row bandwidth exactly as it does in the teacher-neighbour arm.
+        top_indices, neighbor_top_scores = _compute_topk_cosine(
             neighbor_matrix, k=topk_for_graph, device=topk_device
         )
         _, teacher_top_scores = _compute_topk_cosine(
             teacher_embeddings, k=graph_k, device=topk_device
         )
+        top_scores = _cosine_scores_at_indices(
+            teacher_embeddings,
+            top_indices,
+            device=topk_device,
+        )
+        if not fixed_bandwidth:
+            row_temps_override = _knn_bandwidths(teacher_top_scores, graph_k)
+            neighbor_row_temp_p50 = float(
+                np.median(_knn_bandwidths(neighbor_top_scores, graph_k))
+            )
         metadata["neighbor_fingerprint"] = _fingerprint(neighbor_matrix)
     # Recorded but deliberately NOT in _METADATA_KEYS. The teacher fingerprint
     # cannot see this: the same embeddings top-k'd on CPU and on GPU give the same
@@ -803,23 +898,10 @@ def build_or_load_ggpkd_artifact(
         knn_mode=knn_mode,
         holdout_edge_frac=holdout_edge_frac,
         holdout_seed=holdout_seed,
+        row_temps_override=row_temps_override,
     )
-    if teacher_top_scores is not None and not fixed_bandwidth:
-        # The rows above were ranked and softmaxed by the other encoder, which is
-        # what the candidate draw selects on. The temperature the criterion reads
-        # back is the teacher's, exactly as in the teacher graph.
-        neighbor_temps = row_temps
-        row_temps = _knn_bandwidths(teacher_top_scores, graph_k)
-        temp_stats.update(
-            {
-                "row_temp_mean": float(row_temps.mean()),
-                "row_temp_min": float(row_temps.min()),
-                "row_temp_max": float(row_temps.max()),
-                "row_temp_p50": float(np.median(row_temps)),
-                "degenerate_bandwidth_rows": int((row_temps <= MIN_BANDWIDTH).sum()),
-                "neighbor_row_temp_p50": float(np.median(neighbor_temps)),
-            }
-        )
+    if neighbor_row_temp_p50 is not None:
+        temp_stats["neighbor_row_temp_p50"] = neighbor_row_temp_p50
     graph_log_path, graph_stats = _write_knn_graph_log(
         log_dir=log_dir,
         row_neighbors=row_neighbors,

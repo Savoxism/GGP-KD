@@ -1,7 +1,9 @@
 # GGPKD: Heat-Diffusion Manifold Distillation for Text Embeddings
 
-This repository implements GGPKD, a knowledge distillation method that transfers geometric structure from a large teacher embedding model to a compact student model by matching the teacher's one-hop kNN transition rows and auxiliary supervision of the
-teacher-selected candidate rows.
+This repository implements GGPKD, a knowledge distillation method that transfers
+geometric structure from a large teacher embedding model to a compact student.
+The frozen base student's kNN selects comparison sets; teacher cosines define the
+transition targets on those sets.
 
 ## Supported Distillation Pairs
 
@@ -37,23 +39,26 @@ $$t_i = T(x_i)$$
 
 ### 2. kNN Graph Construction
 
-A kNN graph is built from teacher cosine similarities:
+A kNN graph is built from frozen base-student cosine similarities:
 
-$$\mathcal{N}(i) = \operatorname{TopK}_{j \neq i} \cos(t_i, t_j)$$
+$$\mathcal{N}_S(i) = \operatorname{TopK}_{j \neq i} \cos(s_i^0, s_j^0)$$
 
-No edge is filtered: the neighbour set *is* the retrieved list, every node has degree exactly `graph_k`, and no node can be isolated. A mutual filter (keep $i\to j$ only when the two retrieve each other) suppresses hubs at the cost of deleting teacher-selected relations, and is now the `--knn_mode mutual` arm; E2 measured it 0.36 points below the unfiltered graph.
+No edge is filtered: the neighbour set is the retrieved list, every node has
+degree exactly `graph_k`, and no node can be isolated. Teacher-kNN is retained as
+the `--neighbor_source teacher` ablation. Regardless of the source, the teacher
+supplies the target cosine and transition probability for every selected edge.
 
 ### 3. Transition Distribution
 
 Each graph row becomes a transition distribution with a row-specific bandwidth $\tau_i$:
 
-$$P_{ij} = \frac{\exp(\left(\cos(t_i, t_j) / \tau_i\right)}{\sum_{u \in \mathcal{N}(i)} \exp(\left(\cos(t_i, t_u) / \tau_i\right)}$$
+$$P_{ij}^T = \frac{\exp(\left(\cos(t_i, t_j) / \tau_i\right)}{\sum_{u \in \mathcal{N}_S(i)} \exp(\left(\cos(t_i, t_u) / \tau_i\right)},\qquad j\in\mathcal N_S(i)$$
 
 The bandwidth is not tuned globally, and it is not solved either. Each row reads it straight off the retrieval width:
 
 $$\tau_i = \frac{s_i^{(1)} - s_i^{(k)}}{\log k}$$
 
-where $s_i^{(j)}$ is the $j$-th largest cosine from $i$. The $k$-th retrieved neighbour therefore sits $\log k$ nats below the nearest and is exactly $k$ times less likely, for every node, with no constant left to choose. The row is exactly invariant to $s \mapsto as+b$ — the bandwidth scales with the similarities and a softmax is shift-invariant — which is the property that rules out a single fixed temperature.
+where $s_i^{(j)}$ is the teacher's $j$-th largest corpus cosine from $i$. On that teacher reference list, the $k$-th neighbour receives $1/k$ of the nearest neighbour's unnormalized weight. The target is evaluated on the student-selected columns at this teacher-derived scale, so the same endpoint ratio is not asserted for that different set. The target row is exactly invariant to $s \mapsto as+b$ — the bandwidth scales with the teacher similarities and a softmax is shift-invariant — which is the property that rules out a single fixed temperature.
 
 This replaced a target-perplexity solve. That solve ran on a filtered neighbour list, where degree varies: on the production corpus 18.9% of nodes had degree at or below $\rho=30$, never reached the target entropy, and were clipped at their own ceiling, yielding near-uniform targets at bandwidths up to 145x the median. Reading the bandwidth off the raw top-$k$ gives every node the same sample size, so there is no target to miss.
 
@@ -79,17 +84,17 @@ The graph scale is matched at the bandwidth its own row was built at, $\tau_i$; 
 
 All relational scales form one objective, augmented by transition-row supervision:
 
-$$\mathcal{L} = \mathcal{L}_{\text{rel}} + \lambda_{\text{row}} \mathcal{L}_{\text{row}}$$
+$$\mathcal{L} = \lambda_0\mathcal{L}_{r=0} + \lambda_1\mathcal{L}_{r=1} + \lambda_{\text{row}} \mathcal{L}_{\text{row}}$$
 
 where:
 
-- $\mathcal{L}_{\text{rel}} = \tfrac{1}{2}\mathrm{KL}(q_{i,0}\|p^S_{i,0}) + \tfrac{1}{2}\mathrm{KL}(q_{i,1}\|p^S_{i,1})$: the ambient scale $r=0$ over the shared pool and the graph scale $r=1$ over the anchor's own row. The 50/50 split is fixed, not tuned.
-- $\mathcal{L}_{\text{row}}$ promotes every pool column the teacher selected (the whole draw) to an auxiliary row and matches its available teacher transition row with a dense KL, weighted uniformly. Batch anchors are excluded, since $\mathcal{L}_{\text{rel}}$ already matches their transition row at $r=1$. The row set is a deterministic function of the candidate pool, so this term carries no selection hyperparameter.
+- $\mathcal{L}_{r=0}$ is the ambient scale over the shared pool and $\mathcal{L}_{r=1}$ is the graph scale over the anchor's own row. `r0_weight` and `r1_weight` are independent coefficients applied directly, without normalization; both default to 0.5.
+- $\mathcal{L}_{\text{row}}$ promotes every graph-selected pool column to an auxiliary row and matches its available teacher-valued transition row with a dense KL, weighted uniformly. Batch anchors are excluded, since $\mathcal{L}_{\text{rel}}$ already matches their transition row at $r=1$. The row set is a deterministic function of the candidate pool, so this term carries no selection hyperparameter.
 
 ### 7. Per-Epoch Candidate Sampling
 
 Every anchor's candidate set is its **whole transition row** — every column the
-teacher retrieved, and nothing else. There is no truncation, no budget, no draw
+frozen base student retrieved, and nothing else. There is no truncation, no budget, no draw
 and no RNG: the set is a deterministic function of the graph, identical in every
 epoch, and the same width `graph_k` for every anchor. (The padding path — short
 rows padded with the anchor's own index, removed from every softmax by
@@ -109,7 +114,7 @@ stating together:
 - The graph softmax now scores no zero-target column at all, so the
   false-zero gradient that motivated the ambient scale is gone by construction.
   The `amb_mass_on_zero_diff` diagnostic reads ~0.
-- Every column the shared pool spans is now someone's teacher-selected
+- Every column the shared pool spans is now someone's graph-selected
   neighbour, so the ambient scale's comparison is local where it used to reach
   across the corpus; STS Spearman plus the pair-classification thresholds are
   where that would show up first. (The ~4,445 → ~1,400 texts per step recorded
@@ -123,19 +128,20 @@ budget on uniform corpus draws.
 
 ## Configuration
 
-Only genuine experiment controls live in `config/ggpkd_config.py`. Derived
-weights, capacities, and correctness policies are resolved internally:
+Experiment controls live in `config/ggpkd_config.py`; capacities and correctness
+policies are resolved internally:
 
 | Group | Parameters | Description |
 |:---|:---|:---|
-| Teacher Graph | `graph_k` | `graph_k` sets both the kNN width and the per-row bandwidth. `knn_mode` defaults to `directed` (no filter) and `truncation_tolerance` to `0.0` (whole row); both are ablation arms |
+| Relational graph | `graph_k`, `neighbor_source` | `neighbor_source=student` is the method and `teacher` is an ablation. `graph_k` sets the kNN width and teacher-derived row bandwidth; `knn_mode` defaults to `directed` and `truncation_tolerance` to `0.0` |
+| Relational weights | `r0_weight`, `r1_weight` | Independent non-negative coefficients for ambient and graph KL, applied directly with no normalization; defaults 0.5/0.5 |
 | Candidate Sampling | `diffusion_quota`, `hard_neg_k`, `random_neg_k` | All three are `None`/0 in the method: the candidate set is the whole transition row. The ablation baselines set them explicitly |
 | Row Supervision | `row_weight` | Weight of the auxiliary transition-row KL; on for every epoch |
 | Training | `batch_size`, `epochs`, `learning_rate`, `min_lr` | Standard training setup |
 | Ambient profile | `calibration_mode` | `pool` is the method. The shared teacher/student temperature for scale 0 is derived as the median row bandwidth and is not configurable |
 
-GGPKD always uses Top-k support, in-batch sharing and corpus deduplication. Scale weights are `1/r`, the ambient
-weight equals the `r=1` weight, and the fixed-bandwidth baseline uses temperature
+GGPKD always uses Top-k support, in-batch sharing and corpus deduplication. The
+fixed-bandwidth baseline uses temperature
 `0.05`; none is a tunable method knob. Hard-negative storage is sized from
 `graph_k` only when an arm actually draws negatives, so the method's build
 retrieves top-`graph_k` rather than top-`2*graph_k`.
@@ -225,10 +231,10 @@ and print it before aggregating, so the table survives a sweep that loses a run.
 ### Multi-seed suites
 
 `run_paper.sh` trains the three paper pairs at three seeds (9 runs), one run per
-GPU, and reports mean ± std per pair. `sensitivity.sh` sweeps the two declared
-hyperparameters -- `graph_k` and `row_weight` -- on one pair at three seeds
-(8 arms, 24 runs) and reports how far the benchmark average moves along each
-axis. Both build every teacher cache and graph artifact up front, so no two
+GPU, and reports mean ± std per pair. `sensitivity.sh` is the older graph/row
+helper; the paper protocol in `scripts/exp/stage3g_lambda_sensitivity.sh`
+independently sweeps `r0_weight`, `r1_weight`, and `row_weight`. Both build every
+teacher cache and graph artifact up front, so no two
 concurrent runs write the same cache, and both refuse to aggregate if any run
 failed.
 
@@ -236,6 +242,8 @@ failed.
 bash scripts/ggpkd/run_paper.sh                    # 3 pairs x 3 seeds
 GPUS=0,1,2 bash scripts/ggpkd/sensitivity.sh       # graph_k and row_weight
 DRY_RUN=1 GPUS=0 bash scripts/ggpkd/sensitivity.sh # print the arm matrix only
+GRAPH_K=50 GPUS=0,1,2 SEEDS=42,43,44 \
+  bash scripts/exp/stage3g_lambda_sensitivity.sh   # all three loss coefficients
 ```
 
 Overrides: `PAIRS` / `PAIR`, `SEEDS`, `GPUS`, `RUN_ID`, `RESULT_BASE`,
@@ -365,6 +373,7 @@ This repository also includes implementations of other distillation baselines fo
 │   ├── ggpkd/bench_encode.py        # Candidate-encoder throughput bench
 │   ├── ggpkd/run_paper.sh           # 3 pairs x 3 seeds -> summarize.py
 │   ├── ggpkd/sensitivity.sh         # knob sweep -> summarize_sensitivity.py
+│   ├── exp/stage3g_lambda_sensitivity.sh # full-loss sweep for all 3 lambdas
 │   ├── ggpkd/run_metrics.py         # Shared run-tree reader for both summaries
 │   └── talas/                       # + run_paper.sh, summarize.py
 ├── data/                            # Train/val/test CSV datasets

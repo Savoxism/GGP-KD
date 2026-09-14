@@ -7,10 +7,10 @@
 # Read runs/stage0_graph_k/results.csv, then re-invoke with GRAPH_K=<winner>.
 #
 #   GPUS=0,1,2,3            bash scripts/exp/run_all.sh   # stage 0, then stop
-#   GRAPH_K=50 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # stages 1-3
+#   GRAPH_K=50 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # stages 1-3G
 #   DRY_RUN=1 GRAPH_K=50    bash scripts/exp/run_all.sh   # print the plan only
 #
-# Env: FROM / TO restrict the range (0, 1, 2b, 2c, 2d, 3). Everything else is
+# Env: FROM / TO restrict the range (0, 1, 2b, 2c, 2d, 3, 3g). Everything else is
 # forwarded to the stage scripts.
 set -euo pipefail
 
@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-STAGES=(0 1 2b 2c 2d 3)
+STAGES=(0 1 2b 2c 2d 3 3g)
 FROM="${FROM:-}"
 TO="${TO:-}"
 
@@ -45,6 +45,7 @@ script_for() {
         2c) echo "stage2c_dose_response.sh" ;;
         2d) echo "stage2d_components.sh" ;;
         3)  echo "stage3_main_table.sh" ;;
+        3g) echo "stage3g_lambda_sensitivity.sh" ;;
     esac
 }
 

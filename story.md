@@ -18,12 +18,12 @@ for what?*, a question we would then have to answer.
 
 ## 1. Thesis
 
-> What a teacher knows about a text is which few texts in the corpus are similar
-> to it, and in what order. Mini-batch training almost never shows a student
-> those pairs: it compares each text against whatever else happens to share its
-> batch, which in a corpus of any size is almost always a set of unrelated
-> texts. The student spends training being told, over and over, that unrelated
-> things are unrelated.
+> A frozen base student already provides a cheap, per-text shortlist of related
+> corpus items; what it lacks is the teacher's geometry over that shortlist.
+> Mini-batch training almost never shows it those pairs: it compares each text
+> against whatever happens to share its batch, which is almost always unrelated.
+> GGPKD keeps the student's shortlist fixed and asks the teacher how those texts
+> should be ordered and calibrated.
 
 Everything else in the paper is in service of that paragraph.
 
@@ -32,7 +32,8 @@ Everything else in the paper is in service of that paragraph.
 ## 2. The gap, and the number that carries it
 
 Take the corpus this paper trains on: 13,553 texts, batch size 64. Count a
-text's genuine neighbours generously — say its 200 nearest under the teacher.
+text's candidate neighbours generously — say its 200 nearest under the frozen
+base student.
 The expected number of them landing in the same batch is
 
 $$63 \times \frac{200}{13{,}552} \approx 0.93 .$$
@@ -54,13 +55,13 @@ literature chooses them by **what is cheap to have on hand**:
 | SP, RKD, PKT, IRG | the other examples in the batch | batch composition | no |
 | CompRess, SEED, ISD | a memory bank / momentum queue | availability | no |
 | XBM | cross-batch feature memory | availability | no |
-| ANCE, RocketQA | top-$k$ of an ANN index | the student, negatives only | yes |
+| ANCE, RocketQA | top-$k$ of an ANN index | an online student, negatives only | yes |
 | LSP (GCN KD) | graph neighbours | the task's own graph | yes |
-| **GGPKD** | the texts the teacher retrieves for it | **the teacher's own retrieval** | **no** |
+| **GGPKD** | a frozen base student's top-$k$ | **offline student retrieval; teacher-valued targets** | **no** |
 
-Nobody has made the set of compared texts a per-anchor quantity read off the
-teacher, over a corpus with no graph and no labels — and, more to the point,
-nobody has measured what that choice is worth.
+The relevant design point is a fixed, label-free, per-anchor comparison set from
+the deployable model, with a frozen teacher supplying soft relational targets
+rather than labels or negatives.
 
 The reason is not oversight, it is cost: a per-anchor comparison set means
 encoding a different group of texts for every anchor. Queues and memory banks
@@ -70,11 +71,11 @@ exist precisely to avoid that. Section 5 is the answer to that cost.
 
 ## 3. What we claim
 
-**C1 (the finding).** Replacing an anchor's comparisons with the texts the
-teacher retrieves for it — **the same number of comparisons, chosen
-differently** — improves the student. What pays is that the comparisons are with
-genuinely related texts: neither leaving the batch, nor using another model's
-notion of similarity, reproduces the gain. And the effect tracks *how many*
+**C1 (the finding).** Replacing an anchor's batch-local comparisons with the
+texts retrieved by the frozen base student improves the distilled model. What
+pays is that the comparisons are with related texts: drawing the same number
+uniformly from the corpus does not reproduce the gain. The teacher supplies the
+target similarities and ordering on every support. The effect tracks *how many*
 related texts an objective is shown: composing batches from one neighbourhood
 improves the baseline. Enlarging the batch buys the same count only linearly, at
 far more encoder work — a consequence of the count formula, not a trained result.
@@ -84,18 +85,20 @@ the method.* It is there so the difference cannot be attributed to one arm
 simply making more comparisons, exactly as we fix the seed and the learning
 rate. Practical cost is a separate question with its own table.
 
-**C2 (the mechanism is not the point).** The objective is a standard softmax-KL
-over a set of compared texts — the CompRess/SEED form, restricted to the
-teacher's neighbours as in LSP. We change which texts are compared, and nothing
-else. The ablations are designed so this is checkable rather than asserted.
+**C2 (the loss is held fixed).** Every support arm runs the complete objective:
+$\lambda_0\mathcal L_{r=0}+\lambda_1\mathcal L_{r=1}+\lambda_{\rm row}\mathcal
+L_{\rm row}$, with the same weights in every arm. The anchor-row quota is matched; pool width and usable auxiliary
+rows are reported as outcomes of the support. Only the loss-decomposition study
+turns terms off.
 
 **C3 (it is affordable).** Deduplicating the comparison sets of a batch into one
 shared pool, and reusing already-encoded pool members as extra anchors, makes a
 per-anchor comparison set cost roughly what a batch-local objective costs.
 
-**C4 (nothing is tuned).** Two hyperparameters. The per-row temperature, the
-calibration temperature, the balance between the two terms, the comparison set
-and the set of supervised rows are all read off the graph. The per-row
+**C4 (explicit loss balance).** The per-row temperature, calibration
+temperature, comparison set and supervised rows are determined offline.
+`r0_weight` and `r1_weight` are independent coefficients applied directly,
+without normalization; both default to 0.5. The per-row
 temperature $\tau_i$ comes in closed form from the retrieval span, which makes
 each row invariant to the scale of a given teacher's cosines.
 
@@ -123,35 +126,41 @@ Stating these is what keeps C1–C4 credible.
   (`experiments.md`, Stage 2E). Until then the honest phrasing is that the
   student is supervised on the comparisons that carry information, and the title
   should say that.
-- **Not a claim about where the student is wrong.** We choose comparisons by
-  what the teacher finds similar, not by where the student currently errs. Those
-  are different criteria, and the second is ANCE's. See §7.
+- **Not online hard-example mining.** The base-student graph is built once and
+  never follows training error. It selects by similarity, not by where the
+  evolving student currently fails; the latter is ANCE's axis.
 
 ---
 
 ## 5. The method, as the cheapest realisation
 
-Offline, once per (teacher, corpus): encode, $\ell_2$-normalise, retrieve the
-top $k$ for every text. No reciprocity filter — every text the teacher retrieved
-for $i$ is one $i$ gets compared against, and every node has degree exactly $k$.
-Read the temperature off the retrieval span, $\tau_i =
-(s_i^{(1)}-s_i^{(k)})/\log k$, so the $k$-th neighbour is $k$ times less likely
-than the nearest, for every text, with no constant to choose. The teacher row is
-the softmax over those neighbours at $\tau_i$, kept whole — no truncation.
+Offline, once per (teacher, base student, corpus): encode both models and
+$\ell_2$-normalise. The base student retrieves the top $k$ columns for every
+text; the teacher supplies the cosine score on those columns. No reciprocity
+filter is applied, so every node has degree exactly $k$. Read the temperature
+from the teacher's own top-$k$ span, $\tau_i =
+(s_i^{(1)}-s_i^{(k)})/\log k$. On that teacher reference list, the $k$-th item
+receives $1/k$ of the nearest item's unnormalized weight. The target row is the
+softmax of teacher cosines over the student-selected neighbours at $\tau_i$,
+kept whole — no truncation; it need not have the same endpoint ratio because its
+columns came from a different encoder.
 
 During training the comparison set of an anchor **is** its retrieved
 neighbourhood: no sampling, no negatives, no RNG, identical in every epoch. A
 batch encodes the deduplicated union of those sets once, and that single
 encoding pass serves three terms:
 
-$$\mathcal L = \underbrace{\mathcal L_{r=1}}_{\text{order within the neighbourhood}}
- + \underbrace{\mathcal L_{r=0}}_{\text{calibrate levels across the pool}}
+$$\mathcal L = \underbrace{\lambda_1\mathcal L_{r=1}}_{\text{order within the neighbourhood}}
+ + \underbrace{\lambda_0\mathcal L_{r=0}}_{\text{calibrate levels across the pool}}
  + \lambda_{\text{row}}\underbrace{\mathcal L_{\text{row}}}_{\text{reuse pool members as extra anchors}}$$
+
+The default is $\lambda_0=\lambda_1=0.5$. These are absolute coefficients:
+neither is divided by their sum or changed when the other term is removed.
 
 The design principle in one sentence, for the intro:
 
-> Which comparisons are worth making is a property of the teacher's geometry;
-> mini-batches should only decide when it is convenient to compute them.
+> A frozen student graph decides which comparisons are evaluated; the teacher
+> decides what those relations should be; mini-batches only schedule computation.
 
 ---
 
@@ -172,16 +181,16 @@ to fix it by batch size alone. A formula and one figure; no training. (The
 per-pair version — every pair has the same probability
 $\binom{N-2}{B-2}/\binom{N}{B}$ — belongs in a footnote.)
 
-**C1a.** *Comparisons with the teacher's neighbours beat comparisons with batch
-co-occupants, at the same count.*
+**C1a.** *Comparisons with the frozen student's neighbours beat comparisons
+with batch co-occupants, at the same anchor-row count.*
 Falsified if the two tie when the number of comparisons, the loss, the
 temperature and the encoder budget are equal.
-→ **B. Comparison ladder**, arms `in_batch` vs `teacher`.
+→ **B. Comparison ladder**, arms `in_batch` vs `student_knn`.
 
 **C1b.** *What pays is that the texts are related, not that they come from
 outside the batch.*
 Falsified if drawing comparisons uniformly from the whole corpus — batch-free
-but unrelated — matches the teacher's neighbours.
+but unrelated — matches the student's neighbours.
 → **B**, arm `corpus_uniform`.
 
 **C1c.** *The effect tracks the number of related texts an objective sees, not
@@ -192,10 +201,11 @@ batches from one neighbourhood — leaves its score unmoved.
 setting matches steps, data passes and learning rate across $B$ at once. It is
 stated from A's formula and listed as a limitation.
 
-**C1d.** *It has to be this teacher's notion of similarity, not any model's.*
-Falsified if comparisons chosen by the student's own kNN match. This is the arm
-that separates us from ANCE empirically rather than rhetorically.
-→ **B**, arm `student_knn`. **Not yet run in one-factor form.**
+**C1d.** *The shortlist need not be retrieved by the teacher.*
+Falsified if replacing the frozen student's kNN by the teacher's own kNN gives a
+robust improvement. The teacher still values both supports, so this isolates
+whose retrieval chooses the columns.
+→ **B**, arm `teacher_knn`.
 
 **C1e.** *Batch composition changes what a batch-local objective learns and does
 not change what ours learns.*
@@ -203,23 +213,23 @@ Falsified if ours moves with batch composition by more than the pointwise floor
 moves.
 → **C. Composition intervention**, read as difference-in-differences.
 
-**C2.** *The gain comes from which texts are compared, not from the extra terms
-of our loss.*
-Falsified if removing our non-standard parts removes the gap in B — or if the
-gap in B, which runs a deliberately minimal objective, does not survive on the
-shipped one.
-→ **D. Component ablation**, on the full objective.
+**C2.** *The support result holds for the objective we ship.*
+Falsified if the full-objective ladder in B does not separate related support
+from batch-local or corpus-uniform support. Every B arm keeps
+$\mathcal L_{r=0}$, $\mathcal L_{r=1}$ and $\mathcal L_{\rm row}$ active; only
+the loss-decomposition stages remove terms.
+→ **B. Comparison ladder**, with **D. Component ablation** explaining which
+terms earn their place.
 
 **C3.** *A per-anchor comparison set costs about what a batch-local one costs.*
 Falsified if the encoder budget per step is materially higher at the same number
 of comparisons.
 → **B**'s cost columns. Already exported per arm; no new runs.
 
-**C4.** *Nothing is tuned.*
-Falsified if a derived quantity turns out to need tuning, or if the defaults sit
-on a peak.
-→ **G. Sensitivity**, plus the three deletion tests in `experiments.md` Stage 1,
-which ask whether each derived quantity earns its place at all.
+**C4.** *The method is not brittle to its explicit weights.*
+Falsified if the relational balance or row weight sits on a narrow peak.
+→ **G. Sensitivity**, plus the deletion tests in `experiments.md` Stage 1,
+which ask whether each loss group earns its place at all.
 
 **Coverage.** *The student reproduces teacher relations it was never shown.*
 Falsified if held-out teacher pairs are reproduced no better than by an arm that
@@ -231,34 +241,33 @@ whose `pair_order` metric is degenerate.
 
 ## 7. Objections, and the prepared answer
 
-**"This is CompRess with a kNN comparison set."** Correct, and that is the
-point: the loss is held fixed at theirs so the choice of compared texts is the
-only moving part. The ladder quantifies what moving it is worth (+2.7 on the old
-method, at the same count of comparisons). Said first, in related work, with the
-number.
+**"This is CompRess with a kNN comparison set."** The comparison operation is
+prior art; the contribution is the support intervention and its amortized
+implementation. The full objective is held fixed across the ladder. The
+anchor-row quota is matched, while the resulting shared-pool width, auxiliary
+row exposure and encoder cost are measured and reported rather than hidden.
 
 **"ANCE already argued this."** For negatives in a labelled discriminative
 objective, with an index rebuilt from the student during training. Here there
-are no labels, the teacher is frozen, the graph is built once, and the chosen
-texts supply the targets rather than only the contrast.
+are no labels, the base-student index is frozen, and the teacher supplies soft
+targets on the selected texts rather than only a contrast.
 
-**"You should compare where the student is wrong, not where the teacher says
-things are similar."** A fair objection, and a different axis: choosing by the
-teacher's geometry versus choosing by the student's current error. We do not
-claim the second is unnecessary — we do not test it, except insofar as
-`student_knn` touches it. Named as a limitation, not argued away.
+**"You should compare where the student is wrong, not only where it retrieves
+similar texts."** A fair objection, and a different axis. The frozen base
+student chooses by similarity once; it does not mine the evolving student's
+current errors. Online error mining is not tested and remains a limitation.
 
 **"$\mathcal L_{r=0}$ compares against whatever the batch supplies, which is what
 you criticise."** Two answers, decided by measurement (Stage 1.2 and 2C): either
 the full objective is measurably unmoved by batch composition, in which case
-that term calibrates levels rather than choosing comparisons and we say so with
-the number; or it is not, in which case the term changes so that every
-supervised comparison is one the teacher chose.
+that term calibrates levels rather than choosing the anchor support and we say
+so with the number; or it is not, in which case the claim is narrowed and the
+pool dependence is reported explicitly.
 
 **"Only +0.15 from $\mathcal L_{\text{row}}$."** Reported as what it is: a cheap
 add-on that reuses encoded texts, not a pillar. If Stage 1.1 shows its gain does
-not depend on the extra anchors being teacher-chosen, it is removed and the
-method drops to one hyperparameter.
+not depend on the extra anchors being graph-selected, it is removed and the
+method drops one loss coefficient and the corresponding sensitivity sweep.
 
 **"The graph costs $O(N^2d)$."** Stated in the cost paragraph, once, with the
 ANN alternative named. It is paid once per (teacher, corpus) and never at

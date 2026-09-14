@@ -83,12 +83,3 @@ EOF
 method_graph_flags() {
     printf -- '--graph_k %s' "$GRAPH_K"
 }
-
-# The minimal per-anchor objective the comparison ladder is run on: one KL per
-# anchor over that anchor's own columns, at that anchor's own temperature. No
-# calibration term and no extra anchors, so nothing of ours can be credited with
-# a gap that belongs to the choice of compared texts.
-minimal_objective() {
-    printf -- '--relation_target direct --no_ambient --row_weight 0 --batch_size %s' \
-        "${BATCH_SIZE:-64}"
-}

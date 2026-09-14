@@ -1,13 +1,12 @@
-"""The base student's own corpus embeddings, for the student_knn ladder arm.
+"""Frozen base-student corpus embeddings for student-selected kNN support.
 
-Only the graph's columns come from these. The artifact built on them keeps the
-teacher's row temperatures, and the arm reads its targets off the teacher bank,
-so the texts an anchor is compared against are the one thing that differs from
-the teacher arm.
+Only graph columns come from these embeddings. The artifact gathers teacher
+cosines on those columns and uses teacher-derived row temperatures, so every
+target remains teacher-valued even though retrieval comes from the student.
 
 The support is frozen at the base student, before any distillation: following
 the student as it trains would make the arm a moving target rather than a
-controlled comparison.
+fixed method definition.
 """
 
 import torch
@@ -22,7 +21,7 @@ def encode_base_student(
     batch_size: int = 128,
     device: str | torch.device | None = None,
 ) -> torch.Tensor:
-    """CLS-pooled embeddings from a freshly loaded, untrained student.
+    """CLS-pooled embeddings from a freshly loaded pre-distillation student.
 
     Takes the training run's tokenizer rather than loading one by name: the
     MiniLMv2 checkpoints ship a stub tokenizer that `AutoTokenizer` resolves

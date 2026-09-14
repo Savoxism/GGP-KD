@@ -129,9 +129,9 @@ class GGPKDCandidateSampler:
         replacement from every node but the anchor; they differ only in how many:
 
             corpus_uniform  the configured quota, the same number for every
-                            anchor and the same number the teacher arm is given.
+                            anchor and the same number the graph arm is given.
             rewired         this anchor's own degree, so the ragged degree
-                            profile of the teacher graph survives the rewiring
+                            profile of the cached graph survives the rewiring
                             and only the endpoints move.
 
         The returned positions are empty by construction: a position indexes the
@@ -143,7 +143,7 @@ class GGPKDCandidateSampler:
         """
         if self.support_policy == "rewired":
             degree = int((self.pool_indices[idx] >= 0).sum())
-            # Clamped to the budget, not to the raw degree. The teacher arm this
+            # Clamped to the budget, not to the raw degree. The graph arm this
             # is a control for is itself given `diffusion_quota` columns, so an
             # anchor whose row is wider than the budget contributes exactly
             # `diffusion_quota` columns there too -- matching the raw degree would

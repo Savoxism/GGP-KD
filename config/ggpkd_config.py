@@ -1,3 +1,5 @@
+import math
+
 from src.criterions.ggpkd_distillation import (
     CALIBRATION_MODES,
     RELATION_TARGET_ALIASES,
@@ -45,8 +47,10 @@ class GGPKDConfig(BaseConfig):
     # method definition and is always enabled when corpus indices are available.
 
     # ---- Direct Scale (r=0) --------------------------------------------------
-    # The ambient group is assigned the same total weight as the complete graph
-    # group inside the criterion; it is not configurable. Its temperature is
+    # r0_weight and r1_weight are independent non-negative coefficients for the
+    # ambient and graph groups. They are applied directly, with no normalization;
+    # the defaults preserve the previous (0.5, 0.5) full objective. The r=0
+    # temperature is
     # derived at startup as the median graph bandwidth: the ambient target is the
     # transition-row construction with sparsification removed, so the graph's
     # typical bandwidth is its natural scale and no fixed temperature has to be
@@ -69,8 +73,8 @@ class GGPKDConfig(BaseConfig):
     #                 hop there is no composition step left for the name to mean.
     # knn_mode        which retrieval edges survive into the graph (G1):
     #                 directed (method) / mutual / symmetrized. `directed`
-    #                 keeps each node's raw top-k, so every row is supervised
-    #                 on exactly the relations the teacher retrieved for it.
+    #                 keeps each node's raw top-k under the configured neighbour
+    #                 source, so every row has exactly graph_k columns.
     #                 The mutual filter was the earlier default; it is kept as
     #                 an arm because E2 measured it at 73.93 against directed's
     #                 74.29 on the minimal objective (runs/exp2/results.csv),
@@ -92,17 +96,19 @@ class GGPKDConfig(BaseConfig):
     # the ambient KL over the current batch's shared candidate union. `none`
     # deletes the r=0 scale; `--no_ambient` is its CLI spelling.
     calibration_mode = "pool"
+    r0_weight = 0.5
+    r1_weight = 0.5
     knn_mode = "directed"
     batch_local = False
-    # neighbor_source whose kNN decides a row's columns (Stage 2B student_knn):
-    #                 teacher (method) or student -- the *base* student's own
-    #                 top-k. The row temperatures stay the teacher's and the
-    #                 target must come from the teacher bank, so the compared
-    #                 texts are the only thing that moves.
+    # neighbor_source whose kNN decides a row's columns:
+    #                 student (method) -- the frozen base student's own top-k --
+    #                 or teacher (ablation). In either case the teacher supplies
+    #                 the cosine values, transition targets and row temperatures;
+    #                 only the compared texts come from the neighbour source.
     # row_centers     which columns L_row scores an extra anchor j against
-    #                 (Stage 1.1b): teacher (method, N_j within the pool) or
+    #                 (Stage 1.1b): teacher-valued graph row (method, N_j within the pool) or
     #                 random (as many pool columns, drawn uniformly).
-    neighbor_source = "teacher"
+    neighbor_source = "student"
     row_centers = "teacher"
 
     # ---- Motivation study: batch composition, edge holdout -------------------
@@ -117,7 +123,7 @@ class GGPKDConfig(BaseConfig):
     #                     They exist to test whether batch composition changes the
     #                     supervision objective, which it can only do for a loss
     #                     whose support is the batch.
-    # holdout_edge_frac   fraction of teacher graph edges withheld from every
+    # holdout_edge_frac   fraction of cached graph edges withheld from every
     #                     training support (E3). The withheld edges are stored in
     #                     the artifact so a post-hoc evaluation can ask whether the
     #                     student recovered relations it was never supervised on.
@@ -148,7 +154,7 @@ class GGPKDConfig(BaseConfig):
     # the price of not having a second constant.
     fixed_bandwidth = False
     # ---- Row Supervision -----------------------------------------------------
-    # L_row promotes the teacher-selected pool columns (not the hard/uniform
+    # L_row promotes the graph-selected pool columns (not the hard/uniform
     # negatives of an arm) to auxiliary rows and matches each one's complete
     # available transition row, weighted uniformly. Batch anchors are excluded:
     # L_rel already matches their transition row as its r=1 target. The row set is a
@@ -328,6 +334,21 @@ class GGPKDConfig(BaseConfig):
             )
         if self.row_weight < 0:
             raise ValueError("row_weight must be non-negative")
+        if not math.isfinite(self.r0_weight) or not math.isfinite(self.r1_weight):
+            raise ValueError("r0_weight and r1_weight must be finite")
+        if self.r0_weight < 0 or self.r1_weight < 0:
+            raise ValueError("r0_weight and r1_weight must be non-negative")
+        r0_active = self.calibration_mode != "none"
+        r1_active = self.relation_target != "ambient_only"
+        active_weight = (
+            (self.r0_weight if r0_active else 0.0)
+            + (self.r1_weight if r1_active else 0.0)
+            + (self.row_weight if not self.batch_local else 0.0)
+        )
+        if active_weight <= 0:
+            raise ValueError(
+                "the configuration must keep at least one active loss weight positive"
+            )
         if self.diffusion_quota is not None and self.diffusion_quota < 1:
             raise ValueError(
                 "diffusion_quota must be None (the whole transition row) or positive"
@@ -399,43 +420,13 @@ class GGPKDConfig(BaseConfig):
                     f"support_policy={self.support_policy!r} needs an explicit "
                     "--diffusion_quota: there is no transition row to take the "
                     "width from, and the arm is only a control when its support "
-                    "size matches the teacher arm it is compared against"
-                )
-            if self.row_weight > 0:
-                # L_row promotes the drawn columns to auxiliary rows. Under a
-                # random draw those rows have almost no pool-exposed teacher
-                # neighbours, so the term would quietly carry a different amount
-                # of supervision in this arm than in the arm it is compared with.
-                raise ValueError(
-                    f"support_policy={self.support_policy!r} requires "
-                    "row_weight=0: L_row's row set is derived from the support "
-                    "draw, so leaving it on makes the arms differ in two things"
+                    "size matches the graph-support arm it is compared against"
                 )
         if self.neighbor_source not in NEIGHBOR_SOURCES:
             raise ValueError(
                 f"neighbor_source must be one of {NEIGHBOR_SOURCES}, "
                 f"got {self.neighbor_source!r}"
             )
-        if self.neighbor_source == "student":
-            # The artifact's rows are the student's neighbours ranked by the
-            # student. Only the columns may come from there: a transition target
-            # or an L_row row would be the student's opinion, not the teacher's.
-            if self.relation_target != "direct":
-                raise ValueError(
-                    "neighbor_source='student' takes only the compared texts from "
-                    "the student, so its targets must be read off the teacher bank: "
-                    f"it requires relation_target='direct'; got {self.relation_target!r}"
-                )
-            if self.row_weight > 0:
-                raise ValueError(
-                    "neighbor_source='student' requires row_weight=0: L_row would "
-                    "supervise the student's own transition rows"
-                )
-            if self.support_policy in ("corpus_uniform", "rewired"):
-                raise ValueError(
-                    f"support_policy={self.support_policy!r} never reads the graph, "
-                    "so neighbor_source='student' would change nothing"
-                )
         if self.row_centers not in ROW_CENTERS:
             raise ValueError(
                 f"row_centers must be one of {ROW_CENTERS}, got {self.row_centers!r}"

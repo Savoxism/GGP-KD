@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 1 of experiments.md -- three deletion tests. 12 runs.
+# Stage 1 of experiments.md -- loss/component deletion tests. 15 runs.
 #
 # Each asks whether a component earns its place, and each "no" removes a term, a
 # hyperparameter, a paragraph of method and a later sweep. Run before anything
@@ -7,12 +7,10 @@
 #
 #   1.1  --row_weight 0        does L_row earn a hyperparameter?
 #   1.1  random row centers    ... and is its gain about the extra anchors being
-#                              teacher-chosen, or is it just a regulariser?
-#   1.2  --calibration_mode none   does the calibration term earn its place?
+#                              graph-selected, or is it just a regulariser?
+#   1.2  --r0_weight 0        does the calibration term earn its place?
+#   1.2  --r1_weight 0        does the graph-transition term earn its place?
 #   1.3  uniform target        does tau_i earn the per-row temperature machinery?
-#
-# Two of these need patches that do not exist yet (see the patch table in
-# experiments.md). They are skipped with a message rather than failing mid-sweep.
 #
 #   GRAPH_K=50 GPUS=0,1,2,3 bash scripts/exp/stage1_deletions.sh
 set -euo pipefail
@@ -30,13 +28,15 @@ cd "$STAGE_REPO_ROOT"
 EXPERIMENT="stage1_deletions"
 GRAPH_SPEC="main|$CORPUS|$(method_graph_flags)"
 
-# 1.1a and 1.2 need no new code.
+# The zero-weight arms are the explicit loss decomposition. Other arms keep all
+# three loss groups active.
 ARMS_SPEC="row_weight_0|main|ggpkd|--row_weight 0
-no_calibration|main|ggpkd|--calibration_mode none
+no_r0|main|ggpkd|--r0_weight 0
+no_r1|main|ggpkd|--r1_weight 0
 "
 
 # 1.1b -- random row centers. The row term supervises each extra anchor against
-# the texts the teacher retrieved for it; this arm draws those columns at random
+# the texts its graph row selects; this arm draws those columns at random
 # instead. It is the arm that decides whether the term is an eligibility effect
 # or a regulariser, which is why it matters more than --row_weight 0.
 if has_flag "--row_centers"; then
@@ -80,8 +80,10 @@ Rules (compare against Stage 0's graph_k=$GRAPH_K run):
   row_centers_random  gains as much as the real term  -> it is a regulariser;
                                                          delete L_row, the method
                                                          drops to one knob
-  no_calibration      loses <= 0.2                    -> delete the term and the
+  no_r0               loses <= 0.2                    -> delete the term and the
                                                          story's one contradiction
+  no_r1               within noise of full            -> graph targets do not earn
+                                                         their objective term
   uniform_target      ties the transition row         -> delete tau_i and the
                                                          temperature section
 Results: $CSV_OUT

@@ -23,31 +23,35 @@ With one seed, read gaps against the ~0.08 seed sd the 2026-09-12 sweep measured
 |---|---|---|
 | 0.1 `graph_k` sweep | 12 | — |
 | 1.1 row term (2 arms) | 6 | full reference = 0.1 winner |
-| 1.2 calibration term | 3 | " |
+| 1.2 relational groups (`no_r0`, `no_r1`) | 6 | " |
 | 1.3 uniform target | 3 | " |
 | A the count | **0** | analytic |
-| B comparison ladder (4 arms × 2 pairs) | 24 | — |
+| B comparison ladder (4 arms × 1 pair) | 12 | — |
 | C batch composition | 15 | `full @ random` = 0.1 winner |
-| D component ablation | 9 | −row, −calib from Stage 1 |
+| D component/source ablation | 12 | −row, −calib from Stage 1 |
 | E held-out relations | **0** | post-hoc on D |
 | F main table | 6 | pair 1 = 0.1 winner |
-| G sensitivity | 0–9 | `graph_k` from 0.1 |
-| **total** | **90–99** | |
+| G three-lambda sensitivity | 0–18 | default reference and `graph_k` from 0.1 |
+| **total** | **72–90** | |
 
 Most are the 22M student at ~5 min; the 4B→BERT pair in B and F is the expensive
 part.
 
 ---
 
-## Code patches (done 2026-09-13)
+## Code patches (updated 2026-09-14)
 
 | experiment | switch | what it changes, and nothing else |
 |---|---|---|
 | 1.1 random row centers | `--row_centers random` | each L_row row keeps its width $|\Omega_j|$; its columns are drawn uniformly from the pool and its target is the teacher softmax at $\tau_j$ over them |
 | 1.3 uniform target | `--relation_target uniform` | the transition row's columns and $\tau_i$, equal mass on every retrieved neighbour (L_rel and L_row) |
-| B `student_knn` | `--neighbor_source student` | columns from the base student's kNN; teacher row temperatures; the neighbour source is part of the artifact's cache key |
+| relational weights | `--r0_weight`, `--r1_weight` | independent non-negative coefficients applied directly, without normalization; defaults 0.5/0.5 |
+| default graph | `--neighbor_source student` | columns from the frozen base student's kNN; teacher cosine values, transition probabilities and row temperatures; `--neighbor_source teacher` is the source ablation |
+| B complete objective | no deletion flags | all GGPKD comparison arms keep $\mathcal L_{r=0}$, $\mathcal L_{r=1}$ and $\mathcal L_{\rm row}$; only Stages 1 and 2D remove loss terms |
 
-**The 2026-09-12 sweep has three invalid tables.** `student_knn` trained on the
+**All existing training numbers predate the shipped student-kNN/full-loss
+definition and cannot appear in the paper.** In particular, the 2026-09-12
+sweep has three invalid tables. `student_knn` trained on the
 teacher graph: the old helper wrote `graph_student_knn_k200.pt`, the runner looked
 for `graph_student_knn.pt`, found nothing, and built the teacher graph under that
 name — its scores equal the teacher arm's to two decimals. The batch-size half
@@ -55,7 +59,8 @@ of C ran every batch size for 5 epochs, so B = 1024 took 65 optimizer steps
 against 1055 at B = 64; it has been cut (see Cut). D had no full-objective arm
 under its own holdout. The other two are fixed in the scripts; re-run them with
 `ARMS=` (see `scripts/exp/README.md`). The study now runs on
-`qwen3_0_6b_to_minilmv2_h384` only.
+`qwen3_0_6b_to_minilmv2_h384` only. The graph artifact version is now 11, so a
+student-selected artifact cannot silently reuse the older student-valued rows.
 
 ---
 
@@ -82,7 +87,7 @@ beats tied-and-large: it is the whole cost argument.
 
 ---
 
-## Stage 1 — three deletion tests (12 runs)
+## Stage 1 — loss/component deletion tests (15 runs)
 
 Each asks whether a component earns its place. Each "no" removes a term, a
 hyperparameter, a paragraph of method, and a later sweep. Run these before
@@ -91,27 +96,31 @@ anything expensive.
 ### 1.1 Does $\mathcal L_{\text{row}}$ earn a hyperparameter?
 
 Two arms: `--row_weight 0`, and **random row centers** — supervise the extra
-anchor $j$ against random pool columns instead of the ones the teacher retrieved
+anchor $j$ against random pool columns instead of the ones its graph row selects
 for it. The second is the one that matters. The paper claims the extra anchors
-help *because* both ends of each comparison are teacher-chosen, and nothing
+help *because* both ends of each comparison are graph-selected, and nothing
 currently tests that.
 
 Old measurement: `row_weight` 0 → 75.45, 1 → 75.60, 2 → 75.63, seed sd ~0.05.
 
 **Rule.** If random centers also gain ~0.15, the term is a regulariser and not an
-eligibility effect. Delete it: the method drops to **one hyperparameter**, the
+eligibility effect. Delete it: the method loses `row_weight`, the
 eligibility paragraph goes, the `row_weight` sweep in G goes, and so does the
 `row_exposed_mass = 0.44` caveat — the fraction of a neighbourhood a pool
 actually exposes. That is a better outcome for the paper than 0.15 points.
 
-### 1.2 Does the calibration term earn its place?
+### 1.2 Do both relational groups earn their place?
 
-`--calibration_mode none`. It is the only part of the objective whose compared
-texts are decided by the batch, which is the one internal contradiction in the
-story.
+Two explicit zero-weight arms: `--r0_weight 0` and `--r1_weight 0`. These are
+loss-decomposition exceptions; every non-decomposition GGPKD arm keeps both
+weights positive. The first tests calibration, the only relational group whose
+column domain is the full shared pool. The second tests whether the
+student-selected, teacher-valued transition target earns its own loss group.
 
-**Rule.** Loses ≤ 0.2 → delete it, and the contradiction with it. Loses ≥ 0.3 →
-keep it, and C.1 decides whether its batch-dependence is real or only structural.
+**Rule.** If `no_r0` loses ≤ 0.2, delete calibration; if it loses ≥ 0.3,
+keep it and let C decide whether its batch-dependence is material. If `no_r1`
+ties full, the graph-transition group has not earned its place and the method
+story must be reconsidered rather than rescued by the row term.
 
 ### 1.3 Does $\tau_i$ earn the per-row temperature machinery?
 
@@ -131,7 +140,7 @@ simplification. Run it early.
 
 ---
 
-## Stage 2 — the evidence (60 runs; A and E need no GPU)
+## Stage 2 — the evidence (39 training runs; A and E need no GPU)
 
 ### A. The count — the premise, computed (0 runs)
 
@@ -158,37 +167,40 @@ not just use a bigger batch": you can buy the count with batch size, linearly, a
 two orders of magnitude of encoder work. It is stated from the formula, not
 trained (see Cut).
 
-The figure: teacher similarity on the $x$-axis, probability of being compared on
+The figure: base-student similarity on the $x$-axis, probability of being compared on
 the $y$-axis, one curve per method. Batch-local is flat at $(B-1)/(N-1)$
 whatever the similarity; ours is a step at the top-$k$ boundary.
 `scripts/exp/coverage.py` already computes the exposure side.
 
-### B. The comparison ladder — the centrepiece (24 runs)
+### B. The comparison ladder — the centrepiece (12 runs)
 
-One axis moves: which texts an anchor is compared against. The number of
-comparisons, the loss, the temperature, the optimiser and the seed are identical
-across arms — a like-for-like swap, not a cap. The objective is deliberately
-minimal (`--relation_target direct --no_ambient --row_weight 0`) so that no part
-of our method can be credited with the gap.
+Every GGPKD arm runs the complete shipped objective
+$\lambda_0\mathcal L_{r=0}+\lambda_1\mathcal L_{r=1}+\lambda_{\rm row}
+\mathcal L_{\rm row}$, with both relational weights positive. The anchor-row quota, temperature rule, optimiser and
+seed are matched. Because a complete objective reuses a deduplicated pool, its
+$r=0$ domain, usable auxiliary rows and encoder cost can differ with the support;
+those are measured outcomes and must be reported beside the score. Loss terms
+are switched off only in Stages 1 and 2D.
 
 | arm | compared against | kills the explanation |
 |---|---|---|
 | `in_batch` | the rest of the batch | — (the baseline) |
 | `corpus_uniform` | the same number, drawn from the corpus | "you just need to leave the batch" |
-| `student_knn` | the **student's** own top-$k$ | "any semantic neighbourhood would do" |
-| `teacher` | the texts the teacher retrieved | — (ours) |
+| `student_knn` | frozen base-student top-`graph_k`, teacher-valued | — (method) |
+| `teacher_knn` | teacher top-`graph_k`, teacher-valued | "student retrieval is sufficient" |
 
-Old numbers, minimal objective, one pair: teacher 74.29, corpus_uniform 71.61,
-in_batch 71.25, sd ~0.1. The structure is the finding: the arm that compares
-against unrelated texts sits *on top of* the batch-local baseline, not between it
-and ours.
+The old minimal-objective numbers are hypothesis-generating only and cannot be
+reported as evidence for this ladder. The intended signature remains that the
+unrelated corpus draw sits near the batch-local baseline while `student_knn`
+separates from both.
 
-`student_knn` is the most interesting arm in the paper — the ANCE comparison made
-empirical, and the one a reviewer thinks of unprompted. `--neighbor_source
-student` builds the neighbour sets from the base student's embeddings, ranked by
-the student so the quota takes the student's own top-63, keeps the teacher's row
-temperatures, and reads the targets from the teacher (`--relation_target
-direct`), so that *which texts are compared* is the only difference.
+`student_knn` is now the method default. `--neighbor_source student` builds a
+frozen shortlist from base-student embeddings; teacher cosines define the target
+probabilities on those columns and the teacher's own top-`graph_k` span defines
+the row temperature. `--neighbor_source teacher` is the source ablation. With a
+quota below `graph_k`, the configured top-probability policy chooses within the
+frozen shortlist by teacher target mass; do not describe that case as the
+student's literal top-63.
 
 **`rewired` has been dropped: it is now the same arm as `corpus_uniform`.** It
 drew each anchor's *own degree* of random texts, which differed from a fixed
@@ -204,8 +216,9 @@ texts — the only sense in which shape is still free.
 that pair is out of scope from here on.
 
 Cost columns (`cost_*`, `train_encoded_texts_cum`) fall out of the same runs and
-carry C3 for free. Report `corpus_uniform`'s encode count beside ours: an
-off-graph draw deduplicates far worse, and that gap is part of the argument.
+carry C3 for free. Also report the realized $r=0$ pool width and
+`row_count`/row exposure for every arm. They are consequences of running the
+full objective on different supports, not controlled constants.
 
 ### C. Dose–response on the count (15 runs)
 
@@ -213,12 +226,12 @@ A and B say a number matters. C moves that number for a batch-local objective
 and checks the score follows, which turns a previously awkward result into a
 supporting one.
 
-**Raise the count by composing batches (15 runs).** `random` vs
-`teacher_neighbor` batching, arms `pointwise` / `in_batch` / **full GGPKD**,
-3 seeds; `full @ random` is the Stage 0 winner. Filling a batch from one teacher
-neighbourhood raises the count for a batch-local objective and changes nothing
-else, so the prediction is that it improves *for that reason*: the old run has
-`in_batch` gaining +2.25 under teacher-neighbour batching while ours moved 0.07.
+**Raise the count by composing batches (15 runs).** `random` vs graph-neighbour
+batching (the legacy CLI name is `teacher_neighbor`), arms `pointwise` /
+`in_batch` / **full GGPKD**, 3 seeds; `full @ random` is the Stage 0 winner. With
+the default artifact these are frozen-student neighbourhoods. Filling a batch
+from one such neighbourhood raises the count for a batch-local objective; the
+old teacher-graph result is motivation only, not evidence for the current method.
 
 Run it on the **shipped objective**, not the minimal one. The claim that matters
 is about the method we publish, and this is where the calibration term's
@@ -245,8 +258,8 @@ enough.
 
 ### E. Held-out relations (0 runs, post-hoc on D's checkpoints)
 
-Withhold 20 % of the teacher's pairs from every arm's comparison sets, then ask
-whether the student reproduces them anyway. This is the coverage half of the
+Withhold 20 % of the student-selected, teacher-valued graph edges from every
+arm's comparison sets, then ask whether the student reproduces them anyway. This is the coverage half of the
 story and the only evidence that the method generalises past the comparisons it
 was shown.
 
@@ -265,18 +278,25 @@ from the title. A negative we report costs far less than one a reviewer finds.
 
 ---
 
-## Stage 3 — the deliverable (6–15 runs)
+## Stage 3 — the deliverable (6–24 runs)
 
 ### F. Main table (6 runs)
 
 Three teacher→student pairs, 3 seeds, at the Stage 0 operating point with
-whatever Stage 1 left standing; pair 1 is the Stage 0 winner.
+whatever Stage 1 left standing; pair 1 is the Stage 0 winner. Every reported
+GGPKD row uses the complete retained objective.
 
-### G. Sensitivity (0–9 runs)
+### G. Three-lambda sensitivity (0–18 runs)
 
-`graph_k` is already swept in Stage 0 — reuse it. `row_weight` only if 1.1 kept
-the term. This exists to show the defaults are not sitting on a peak, which is
-C4. It is not a search.
+`graph_k` is already swept in Stage 0 — reuse it. The default
+$(\lambda_0,\lambda_1,\lambda_{\rm row})=(0.5,0.5,1.0)$ point is also the Stage
+0 winner and is not repeated. Change one coefficient at a time: test
+$\lambda_0\in\{0.25,1.0\}$, $\lambda_1\in\{0.25,1.0\}$, and
+$\lambda_{\rm row}\in\{0.5,2.0\}$ while pinning the other two to their defaults.
+These are six full-loss arms; no coefficient is zero and there is no
+normalization. Run `scripts/exp/stage3g_lambda_sensitivity.sh`. This exists to
+show the defaults are not sitting on a narrow peak, which is C4. It is not a
+search.
 
 ---
 
@@ -298,27 +318,27 @@ C4. It is not a search.
 - **Multi-hop radius ablation.** Removed from the codebase; reporting it would
   mean restoring the pipeline first.
 - **`teacher_diverse` batch sampler.** Within noise of `random`.
-- **More points on either sensitivity sweep.** Both surfaces are flat; extra
-  points buy nothing and invite "tuned on test".
+- **More points on any lambda sensitivity axis.** The local curves establish
+  robustness; extra points buy nothing and invite "tuned on test".
 
 ---
 
 ## Order
 
 ```
-patches  random-centers · uniform-target · one-factor student_knn
+patches  random-centers · uniform-target · student-kNN default/full targets
 Stage 0  0.1 graph_k                     12   ── fixes the operating point,
                                               ── and is the full-model reference
 Stage 1  1.1 row term                     6   ── each "no" deletes later work
-         1.2 calibration term             3
+         1.2 relational groups            6
          1.3 uniform target               3
 Stage 2  A   the count                    0   ── formula + one figure
-         B   ladder (4 arms, 2 pairs)     24
+         B   ladder (4 arms, 1 pair)      12
          C   batch composition            15
-         D   component ablation            9
+         D   component ablation           12
          E   held-out relations           0   ── post-hoc on D
 Stage 3  F   main table                    6
-         G   sensitivity                0–9
+         G   three-lambda sensitivity  0–18
 ```
 
 Stage 0 is strictly first. Stage 1 before Stage 2, because a deletion there

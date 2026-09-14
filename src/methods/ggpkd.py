@@ -43,7 +43,7 @@ def resolve_anchor_column(ctx, df: pd.DataFrame) -> str:
             f"GGPKD needs column {column!r} for task_type={cfg.task_type!r}"
         )
 
-    # The teacher graph is built over this column only. If a genuine second view
+    # The cached graph is built over this column only. If a genuine second view
     # exists it is dropped, and doing that silently would leave the graph
     # describing a different object than the loss thinks it does.
     partner = {"pair_cls": "hypothesis", "pair_reg": "sentence2"}.get(cfg.task_type)
@@ -104,7 +104,7 @@ def prepare_frame(ctx, df: pd.DataFrame):
 
 
 def build_data(ctx, df: pd.DataFrame, teacher_cls: torch.Tensor):
-    """Build the teacher graph, the candidate sampler, and the dataset over them.
+    """Build the teacher-valued graph, candidate sampler, and dataset over them.
 
     The graph is built after the teacher model has been freed, so the block-wise
     cosine pass in `build_or_load_ggpkd_artifact` has the teacher's VRAM to
@@ -253,6 +253,8 @@ def build_criterion(ctx, config):
         teacher_embeddings=ctx.teacher_cls_all if needs_bank else None,
         calibration_mode=config.calibration_mode,
         direct_temp=config.direct_temp,
+        r0_weight=config.r0_weight,
+        r1_weight=config.r1_weight,
         row_weight=config.row_weight,
         relation_target=config.relation_target,
         row_centers=config.row_centers,
@@ -265,6 +267,8 @@ def build_criterion(ctx, config):
         f"batch_local={config.batch_local}, "
         f"calibration={config.calibration_mode}, "
         f"relation_target={config.relation_target}, "
+        f"r0_weight={config.r0_weight}, "
+        f"r1_weight={config.r1_weight}, "
         f"row_weight={config.row_weight}, "
         f"row_centers={config.row_centers}, "
         f"neighbor_source={config.neighbor_source}"

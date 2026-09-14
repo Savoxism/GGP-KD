@@ -1,3 +1,4 @@
+import math
 from collections.abc import Sequence
 
 import torch
@@ -148,7 +149,7 @@ class GGPKDDistillation(nn.Module):
     and a single global cosine threshold read. But its column set has changed
     character. It used to span ~4,445 pool columns per batch, of which ~1,160
     were uniform corpus draws belonging to no anchor's neighbourhood; it now
-    spans ~1,400, every one of which is some anchor's teacher-selected
+    spans ~1,400, every one of which is some anchor's graph-selected
     neighbour. The calibration r=0 performs is therefore local where it used to
     reach across the corpus. That is the standing risk of the no-negatives
     method, and the out-of-domain pair and STS benchmarks are where it would
@@ -251,13 +252,10 @@ class GGPKDDistillation(nn.Module):
       last free student temperatures, and under ``row_temps`` it inherits the
       per-row tie automatically: tau_r(i) = sqrt(r) * tau_i.
 
-    **Scale weights.** Within the graph group, ``omega_r`` is proportional to
-    ``1/r``.  Those graph weights are normalized to sum to one, and the ambient
-    group receives the same total unnormalized weight.  The final normalization
-    therefore keeps a 50/50 ambient--graph split whenever ambient supervision is
-    active, independent of how many diffusion radii are requested.  This makes the
-    radius ablation change the graph target ladder without also increasing the
-    graph group's effective loss weight.
+    **Relational weights.** ``r0_weight`` and ``r1_weight`` are explicit,
+    independent non-negative coefficients for the ambient and one-hop graph
+    groups. They are applied directly, without normalization. Both default to
+    0.5, preserving the previous full objective.
 
     Passing removed or derived knobs raises rather than being silently absorbed.
     """
@@ -271,7 +269,7 @@ class GGPKDDistillation(nn.Module):
             "unused, as student_dim: the teacher width comes from teacher_embeddings"
         ),
         "row_mode": (
-            "L_row has one mechanism: the teacher-selected pool columns, weighted "
+            "L_row has one mechanism: the graph-selected pool columns, weighted "
             "uniformly. Walk selection, exposed-mass weighting and inverse-inclusion "
             "weighting were measured and removed -- see the class docstring"
         ),
@@ -282,9 +280,9 @@ class GGPKDDistillation(nn.Module):
         "num_walks": "removed with walk-based row selection",
         "walk_length": "removed with walk-based row selection",
         "scale_weights": (
-            "there is one graph scale and its weight equals the ambient weight"
+            "there is one graph scale; use r1_weight for its direct coefficient"
         ),
-        "direct_weight": "derived to equal the total graph-group weight",
+        "direct_weight": "renamed to r0_weight",
         "share_in_batch": "in-batch sharing is always used when corpus indices exist",
         "graph_temp": (
             "canonical rows use their stored bandwidths; the scalar fixed-bandwidth "
@@ -327,6 +325,8 @@ class GGPKDDistillation(nn.Module):
         direct_temp: float = 0.10,
         transition_neighbors: torch.Tensor | None = None,
         transition_probs: torch.Tensor | None = None,
+        r0_weight: float = 0.5,
+        r1_weight: float = 0.5,
         row_weight: float = 0.5,
         row_temps: torch.Tensor | None = None,
         relation_target: str = "transition",
@@ -368,10 +368,8 @@ class GGPKDDistillation(nn.Module):
         # as one KL against the teacher's similarity profile over the scored
         # columns. That is batch-local relational knowledge distillation in KL
         # form, and it is the S1 baseline: no graph, no support selection, no rows.
-        # The group is *removed* rather than given a zero target -- a zero-target
-        # scale still holds its weight in the normalization, so leaving it in would
-        # silently scale the whole loss down by the dead group's share (0.64 at
-        # R={1,2,4}) and hand the baseline a different effective learning rate.
+        # The group is *removed* rather than given a zero target so diagnostics and
+        # the executed objective both state exactly which loss terms are present.
         relation_target = RELATION_TARGET_ALIASES.get(relation_target, relation_target)
         if relation_target not in RELATION_TARGETS:
             raise ValueError(
@@ -379,6 +377,12 @@ class GGPKDDistillation(nn.Module):
                 f"got {relation_target!r}"
             )
         self.relation_target = relation_target
+        if not math.isfinite(r0_weight) or not math.isfinite(r1_weight):
+            raise ValueError("r0_weight and r1_weight must be finite")
+        if r0_weight < 0.0 or r1_weight < 0.0:
+            raise ValueError("r0_weight and r1_weight must be non-negative")
+        self.r0_weight = float(r0_weight)
+        self.r1_weight = float(r1_weight)
         if row_weight < 0.0:
             raise ValueError("row_weight must be non-negative")
         self.row_weight = float(row_weight)
@@ -460,6 +464,14 @@ class GGPKDDistillation(nn.Module):
                 "else; calibration_mode='none' would leave the objective empty"
             )
         self.use_direct = teacher_embeddings is not None
+        active_relational_weight = (
+            (self.r0_weight if self.use_ambient_scale else 0.0)
+            + (self.r1_weight if self.relation_target != "ambient_only" else 0.0)
+        )
+        if active_relational_weight <= 0.0 and self.row_weight <= 0.0:
+            raise ValueError(
+                "the criterion must keep at least one active loss weight positive"
+            )
         if self.use_direct:
             if direct_temp <= 0.0:
                 raise ValueError("direct_temp must be positive")
@@ -480,12 +492,16 @@ class GGPKDDistillation(nn.Module):
 
         # One hop, so there is no ladder: the graph group is a single scale whose
         # target IS the transition row, and its temperature is that row's own
-        # bandwidth. `direct_weight` gives the ambient profile the same
-        # unnormalized weight as the graph group, a fixed 50/50 after the runtime
-        # normalization. The multi-hop ladder this replaced derived
+        # bandwidth. r0_weight and r1_weight are independent group coefficients,
+        # applied directly without normalization. The defaults are 0.5/0.5. The
+        # multi-hop ladder this replaced derived
         # tau_r = sqrt(r) * tau_1 and omega_r ~ 1/r from `diffusion_scales`.
-        self.register_buffer("scale_weights", torch.ones(1, dtype=torch.float32))
-        self.register_buffer("direct_weight", torch.ones(1, dtype=torch.float32))
+        self.register_buffer(
+            "scale_weights", torch.tensor([self.r1_weight], dtype=torch.float32)
+        )
+        self.register_buffer(
+            "direct_weight", torch.tensor([self.r0_weight], dtype=torch.float32)
+        )
         self.register_buffer(
             "scale_temps", torch.full((1,), float(self.graph_temp), dtype=torch.float32)
         )
@@ -671,7 +687,7 @@ class GGPKDDistillation(nn.Module):
         selected_columns: torch.Tensor,
         anchor_columns: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Match transition rows at the teacher-selected non-anchor pool columns.
+        """Match transition rows at the graph-selected non-anchor pool columns.
 
         ``selected_columns`` marks the columns carrying diffusion mass for some
         anchor -- the teacher-chosen part of the draw, excluding hard and uniform
@@ -922,13 +938,16 @@ class GGPKDDistillation(nn.Module):
             similarity = anchor_norm @ pool_norm.t()
             target = target.masked_fill(self_mask.unsqueeze(1), 0.0)
             target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            # The row set for the closure modes, read off the diffusion target while
-            # it still *is* the diffusion target -- the ambient scale is concatenated
-            # below and is dense over the whole pool, so after that point every column
-            # would look selected. A column is teacher-selected if some anchor's draw
-            # gave it positive diffusion mass; hard and uniform negatives do not
-            # qualify. Anchors are tracked separately so they can be excluded.
-            selected_columns = (target.sum(dim=1) > 0).any(dim=0)
+            # The row set for L_row is the support draw, read before the ambient
+            # scale is concatenated. Transition targets mark it by positive graph
+            # mass. Direct targets are constructed below from the teacher bank, so
+            # their incoming tensor may be all-zero (batch-local/corpus-uniform);
+            # in that case the ownership mask is the support definition. This is
+            # what lets every comparison arm run the same complete objective.
+            if self.relation_target == "direct":
+                selected_columns = own_mask.any(dim=0)
+            else:
+                selected_columns = (target.sum(dim=1) > 0).any(dim=0)
             anchor_columns = self_mask.any(dim=0)
         else:
             # Only reachable without corpus indices, which the production path
@@ -963,9 +982,8 @@ class GGPKDDistillation(nn.Module):
         temps = self.scale_temps
 
         if self.relation_target == "ambient_only":
-            # Drop the diffusion group: no scales, no weight, nothing to
-            # normalize against. The ambient scale prepended below then carries
-            # weight 1 and is the entire objective.
+            # Drop the graph group. The ambient scale prepended below retains its
+            # configured r0_weight and is the entire relational objective.
             target = target[:, :0, :]
             weights = weights[:0]
             temps = temps[:0]
@@ -1035,8 +1053,6 @@ class GGPKDDistillation(nn.Module):
             n_scales += 1
         else:
             direct_mask = self_mask
-        weights = weights / weights.sum().clamp_min(1e-12)
-
         log_target = torch.where(
             target > 0, target.clamp_min(1e-12).log(), torch.zeros_like(target)
         )
@@ -1089,9 +1105,9 @@ class GGPKDDistillation(nn.Module):
         # Semantic decomposition of the relational stack. Scale r=0 is the
         # ambient teacher-similarity profile, r=1 is the direct transition row,
         # and r>1 are the genuinely multi-hop diffusion targets. The grouped
-        # diagnostics are normalized within their own groups; ``loss_rel`` keeps
-        # the configured fixed group weighting exactly, so this split does not
-        # alter the optimized objective.
+        # multi-hop diagnostics, if ever restored, are normalized within that
+        # subgroup; ``loss_rel`` keeps the configured direct coefficients, so
+        # this does not alter the optimized objective.
         loss_rel = (kl_per_scale * weights.view(1, -1)).sum(dim=-1).mean()
         zero = loss_rel.new_zeros(())
         loss_amb = kl_per_scale[:, 0].mean() if offset else zero
@@ -1283,6 +1299,8 @@ class GGPKDDistillation(nn.Module):
         # is actually in the loss, ambient included.
         weighted_entropy = (target_entropy * weights.view(1, -1)).sum(dim=-1)
         row_zero = loss_row.new_zeros(())
+        effective_r0_weight = weights[0] if offset else row_zero
+        effective_r1_weight = weights[offset] if weights.numel() > offset else row_zero
 
         # Per-anchor L_rel, before it is averaged away. `loss_rel` alone cannot say
         # whether the objective is uniformly hard or dominated by a few anchors --
@@ -1324,6 +1342,10 @@ class GGPKDDistillation(nn.Module):
             ("loss_cal", loss_amb.detach()),
             ("loss_amb", loss_amb.detach()),
             ("loss_nbr", loss_nbr.detach()),
+            ("r0_weight_effective", effective_r0_weight.detach()),
+            ("r1_weight_effective", effective_r1_weight.detach()),
+            ("loss_r0_weighted", (effective_r0_weight * loss_amb).detach()),
+            ("loss_r1_weighted", (effective_r1_weight * loss_nbr).detach()),
             ("loss_diff", loss_diff.detach()),
             ("loss_row", loss_row.detach()),
             ("loss_row_weighted", (self.row_weight * loss_row).detach()),
