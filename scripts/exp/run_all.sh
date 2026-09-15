@@ -1,34 +1,35 @@
 #!/usr/bin/env bash
-# Runs every stage in experiments.md, in the order that file prescribes.
+# Runs every table of story.md §5, in the order the tables depend on each other.
 #
-# It deliberately STOPS after Stage 0 when GRAPH_K is unset. Stage 0 chooses the
-# operating point and the rule for choosing it is a judgement call -- smallest
-# graph_k within one seed-sd of the best Avg -- so a script must not guess it.
-# Read runs/stage0_graph_k/results.csv, then re-invoke with GRAPH_K=<winner>.
+# It deliberately STOPS after Table 5 when GRAPH_K is unset. Table 5 chooses the
+# operating point and the rule for choosing it is a judgement call -- the
+# smallest k at which Avg saturates and the reciprocal graph is about connected --
+# so a script must not guess it. Read runs/table5_graph_k/results.csv, then
+# re-invoke with GRAPH_K=<k>.
 #
-#   GPUS=0,1,2,3            bash scripts/exp/run_all.sh   # stage 0, then stop
-#   GRAPH_K=50 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # stages 1-3G
-#   DRY_RUN=1 GRAPH_K=50    bash scripts/exp/run_all.sh   # print the plan only
+#   GPUS=0,1,2,3             bash scripts/exp/run_all.sh   # Table 5, then stop
+#   GRAPH_K=100 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Tables 3, 4, 6, 1, 2
+#   DRY_RUN=1 GRAPH_K=100    bash scripts/exp/run_all.sh   # print the plan only
 #
-# Env: FROM / TO restrict the range (0, 1, 2b, 2c, 2d, 3, 3g). Everything else is
-# forwarded to the stage scripts.
+# Env: FROM / TO restrict the range (5, 3, 4, 4h, 6, 1, 2). Everything else is
+# forwarded to the table scripts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-STAGES=(0 1 2b 2c 2d 3 3g)
+TABLES=(5 3 4 4h 6 1 2)
 FROM="${FROM:-}"
 TO="${TO:-}"
 
 in_range() {
-    local stage="$1" seen_from=0 i
+    local table="$1" seen_from=0 i
     [[ -z "$FROM" && -z "$TO" ]] && return 0
-    for i in "${STAGES[@]}"; do
+    for i in "${TABLES[@]}"; do
         [[ -n "$FROM" && "$i" == "$FROM" ]] && seen_from=1
         [[ -z "$FROM" ]] && seen_from=1
-        if [[ "$i" == "$stage" ]]; then
+        if [[ "$i" == "$table" ]]; then
             (( seen_from )) || return 1
             return 0
         fi
@@ -39,85 +40,86 @@ in_range() {
 
 script_for() {
     case "$1" in
-        0)  echo "stage0_graph_k.sh" ;;
-        1)  echo "stage1_deletions.sh" ;;
-        2b) echo "stage2b_ladder.sh" ;;
-        2c) echo "stage2c_dose_response.sh" ;;
-        2d) echo "stage2d_components.sh" ;;
-        3)  echo "stage3_main_table.sh" ;;
-        3g) echo "stage3g_lambda_sensitivity.sh" ;;
+        5)  echo "table5_graph_k.sh" ;;
+        3)  echo "table3_exposure.sh" ;;
+        4)  echo "table4_loss_terms.sh" ;;
+        4h) echo "table4_heldout.sh" ;;
+        6)  echo "table6_robustness.sh" ;;
+        1)  echo "table1_main.sh" ;;
+        2)  echo "table2_cost.sh" ;;
     esac
 }
 
-failed=()
-for stage in "${STAGES[@]}"; do
-    in_range "$stage" || continue
-    if [[ "$stage" != "0" && -z "${GRAPH_K:-}" ]]; then
-        cat <<'EOF'
+for value in "$FROM" "$TO"; do
+    [[ -z "$value" ]] && continue
+    if [[ -z "$(script_for "$value")" ]]; then
+        echo "FROM/TO must be one of: ${TABLES[*]} (got: $value)" >&2
+        exit 2
+    fi
+done
 
-==============================================================
-Stage 0 is done. Stopping here on purpose.
+rule() { printf '%s\n' "--------------------------------------------------------------"; }
+
+failed=()
+for table in "${TABLES[@]}"; do
+    in_range "$table" || continue
+    if [[ "$table" != "5" && -z "${GRAPH_K:-}" ]]; then
+        echo
+        rule
+        cat <<'EOF'
+Table 5 is done. Stopping here on purpose.
 
 Pick the operating point before anything else runs:
 
-    column -s, -t runs/stage0_graph_k/results.csv | less -S
+    column -s, -t runs/table5_graph_k/results.csv | less -S
 
-Rule: the smallest graph_k within one seed-sd of the best Avg. Small beats
-tied-and-large -- it is the whole cost argument. Then:
+Rule: the smallest k at which Avg saturates (within ~0.2 of the best) and the
+reciprocal graph is about connected. Small beats tied-and-large -- it is the
+whole cost argument. Then:
 
-    GRAPH_K=<winner> bash scripts/exp/run_all.sh
-==============================================================
+    GRAPH_K=<k> bash scripts/exp/run_all.sh
 EOF
+        rule
         exit 0
     fi
-    script="$(script_for "$stage")"
+    script="$(script_for "$table")"
     echo
-    echo "=============================================================="
-    echo "Stage $stage -- $script"
-    echo "=============================================================="
-    # Second pass: the operating point is already known, so Stage 0 has nothing
-    # left to sweep. It still runs at that one setting, because its seeds are
-    # the full-model reference Stages 1, 2D and 3 compare against.
-    if [[ "$stage" == "0" && -n "${GRAPH_K:-}" ]]; then
-        echo "GRAPH_K=$GRAPH_K is already chosen: running Stage 0 at that setting"
-        echo "only, to materialise the full-model reference (3 runs, not 12)."
-        if GRAPH_KS="$GRAPH_K" bash "$SCRIPT_DIR/$script"; then
+    rule
+    echo "Table $table -- $script"
+    rule
+    # Second pass: the k sweep already ran. Table 5 still has to hold the run at
+    # GRAPH_K, because it is Table 6's default row and Table 1's pair (c); run just
+    # that one setting if it is missing, and skip the table otherwise.
+    if [[ "$table" == "5" && -n "${GRAPH_K:-}" ]]; then
+        csv="$REPO_ROOT/runs/table5_graph_k/results.csv"
+        if [[ -f "$csv" ]] && grep -q ",graph_k_$GRAPH_K," "$csv"; then
+            echo "GRAPH_K=$GRAPH_K is already chosen and Table 5 holds its run: skipping"
             continue
         fi
-        code=$?
-        failed+=("$stage")
-        echo "Stage $stage failed with exit $code" >&2
+        echo "GRAPH_K=$GRAPH_K is already chosen: running Table 5 at that k only,"
+        echo "to materialise the reference Tables 1 and 6 read."
+        code=0
+        GRAPH_KS="$GRAPH_K" bash "$SCRIPT_DIR/$script" || code=$?
+        if (( code == 0 )); then
+            continue
+        fi
+        failed+=("$table")
+        echo "Table $table failed with exit $code" >&2
         break
     fi
-    if bash "$SCRIPT_DIR/$script"; then
-        :
-    else
-        code=$?
-        failed+=("$stage")
-        echo "Stage $stage failed with exit $code" >&2
-        # Later stages read earlier ones, so a failure is not something to run
-        # past: stop and let the operator look.
+    code=0
+    bash "$SCRIPT_DIR/$script" || code=$?
+    if (( code != 0 )); then
+        failed+=("$table")
+        echo "Table $table failed with exit $code" >&2
+        # Later tables read earlier ones (4h scores 4's checkpoints, 6 and 1 read
+        # 5's reference), so a failure is not something to run past.
         break
     fi
 done
 
 if (( ${#failed[@]} > 0 )); then
     echo
-    echo "Failed stages: ${failed[*]}" >&2
+    echo "Failed tables: ${failed[*]}" >&2
     exit 1
-fi
-
-if [[ "${DRY_RUN:-0}" != "1" && -n "${GRAPH_K:-}" ]]; then
-    cat <<'EOF'
-
-==============================================================
-Training done. Two things left, neither of which needs a GPU:
-
-  A  the count: (B-1) * k / (N-1). Analytic, plus one exposure curve from
-     scripts/exp/coverage.py.
-  E  held-out pairs, post-hoc on Stage 2D's checkpoints:
-         bash scripts/exp/exp3_heldout_geometry.sh
-     Read spearman_anchor beside the pooled spearman.
-==============================================================
-EOF
 fi

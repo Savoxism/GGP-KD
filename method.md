@@ -1,168 +1,148 @@
-# GGPKD — Method Specification
+# GGPKD — method specification
 
-Relational knowledge distillation from an embedding teacher to a small student.
-The frozen base student's kNN selects each row's columns; the teacher supplies
-the similarities and transition targets on those columns.
+Subgraph distillation of a teacher's kNN geometry into a compact student. This
+file specifies what `main.py --method ggpkd` computes. The paper plan is
+`story.md` (§2 method, §3 theory, §5 tables); this file follows it.
 
-The method has four explicit structure/loss settings: `graph_k`, `r0_weight`,
-`r1_weight`, and `row_weight`. The three loss coefficients are independent and
-are applied directly; none is normalized against another.
-Bandwidths, temperatures, the candidate set, and supervised rows are derived
-from the cached corpus embeddings.
-
-The radius is one hop: the objective matches the teacher's transition rows
-directly. Multi-hop diffusion has been removed, not merely defaulted off.
+Notation: $N$ corpus size, $B$ the anchor batch, $k$ = `graph_k`,
+$s^T_{ju}$ and $s^S_{ju}$ teacher and student cosines ($\ell_2$-normalized
+embeddings).
 
 ---
 
-## 1. Offline: a student-selected, teacher-valued graph
+## 1. Offline graph (once per teacher, corpus, `graph_k`)
 
-Built once per (teacher, corpus) and cached.
+Built by `src/ggpkd/graph_builder.py`, cached at `--ggpkd_cache_path`
+(artifact version 12).
 
-**1.1 Encode.** The teacher and the frozen base student each embed the
-deduplicated corpus once; vectors are L2-normalized, so all similarities below
-are cosines.
+1. **Encode.** The teacher embeds the deduplicated corpus once (cached at
+   `--cache_path`).
+2. **Neighbours.** $N(j)$ is the directed top-$k$ of text $j$ under the teacher,
+   self excluded. Rows are kept whole: every row has $k$ columns.
+3. **Bandwidth.** From the teacher's raw top-$k$ cosines,
+   $$\tau_j=\frac{s^{(1)}_j-s^{(k)}_j}{\log k}.$$
+   The $k$-th neighbour gets $1/k$ of the nearest neighbour's unnormalized
+   weight. Under $s\mapsto as+b$, $\tau_j\mapsto a\tau_j$ and the softmax is
+   shift-invariant, so each row is invariant to the teacher's cosine scale.
+4. **Target row.**
+   $P^T_j(u)=\mathrm{softmax}_{u\in N(j)}\big(s^T_{ju}/\tau_j\big)$.
+5. **Holdout (Table 4 only).** `--holdout_edge_frac f` withholds a fraction $f$
+   of edges before the rows are normalized. The split is a symmetric hash of the
+   unordered pair and `--holdout_seed`, so it is the same across arms and seeds,
+   and the evaluation can recompute it.
 
-**1.2 Retrieve.** For each node `i`, retrieve the `k = graph_k` highest-cosine
-other nodes under the base student. This student kNN is the method; teacher kNN
-is the source ablation. Self is excluded during retrieval.
-
-**1.3 Teacher bandwidth.** Each row reads its temperature from the teacher's own
-raw top-k span:
-
-$$\tau_i = \frac{s_i^{(1)} - s_i^{(k)}}{\log k}$$
-
-where $s_i^{(j)}$ is the teacher's $j$-th largest corpus cosine from `i`. On the
-teacher's own reference top-$k$, the $k$-th neighbour sits $\log k$ nats below
-the nearest and receives $1/k$ of its unnormalized weight. The actual target is
-then evaluated on the student-selected columns at this teacher-derived scale;
-it does not imply the same endpoint ratio within that different set.
-
-*Affine invariance.* Under $s \mapsto as + b$ the bandwidth scales as
-$\tau \mapsto a\tau$, so the logits become $s_j/\tau_i + b/(a\tau_i)$. The second
-term does not depend on $j$ and a softmax is shift-invariant, so **the row is
-unchanged**. This is the property that rules out a single global temperature,
-which would otherwise have to be retuned for every teacher whose cosines are
-spread differently.
-
-*Fixed sample size.* The scores come from the raw top-$k$, read **before** the
-mutual filter, so all $k$ values exist for every node whenever $k < n$. There is
-no degree to fall short of and no target entropy to miss.
-
-**1.4 Edge rule.** None. The neighbour set is the base student's retrieved list,
-`N_S(i) = topk_S(i)`, so every node has degree `graph_k`. A mutual filter remains
-the `--knn_mode mutual` ablation. With no filter, no node can be isolated.
-
-**1.5 Teacher transition row.** Over the student-selected neighbours,
-
-$$P^T(j \mid i) = \operatorname{softmax}_{j\in N_S(i)}\!\left(s^T_{ij} / \tau_i\right)$$
-
-Thus the student chooses which texts are compared, but never supplies its own
-target values.
-
-**1.6 No truncation.** The row is kept whole. Every student-selected column
-carries its teacher probability into the objective, so all rows have exactly
-`graph_k` columns, nothing about the target depends on a numerical constant, and
-collation needs no padding.
-
-> A mass-prefix truncation (`--truncation_tolerance 0.01`: keep the smallest
-> prefix holding 99% of the row) remains as an arm, and the multi-hop arms
-> require it — a diffused row is dense and cannot be carried whole.
-
-The artifact stores the rows and their bandwidths.
+Graph-build stats go to `<ggpkd_log_dir>/knn_graph_neighbors.jsonl`. They
+include `reciprocal_components`, `reciprocal_isolated`,
+`reciprocal_largest_frac` and `reciprocity`, all computed on the reciprocal
+graph $G^\leftrightarrow$ ($u\sim j$ iff $u\in N(j)$ and $j\in N(u)$) of the
+training edges. They also include `target_kl_uniform`, and the build warns
+when it falls below 0.05 (rows close to uniform).
 
 ---
 
-## 2. Training: the candidate set
+## 2. Per step
 
-For each anchor, the candidate set is **its whole transition row** — every
-column retrieved by the frozen base student, and nothing else. No negatives are drawn.
-
-There is no budget, no selection and no RNG. The set is a deterministic function
-of the graph, is **identical in every epoch**, and is the same width `graph_k`
-for every anchor. (The padding path — short rows padded with the anchor's own
-index, removed from every softmax by the self-mask — is still there for the arms
-that produce ragged rows, and is inert for the method.)
-
-Each step encodes the deduplicated union of the batch's candidate sets — the
-**shared pool**. This is essentially the whole step cost, and it is now the
-union of `|B|` rows of width `graph_k` rather than of truncated rows: re-measure
-it before quoting a number (the ~1,400 texts per batch of 64 recorded here was a
-mutual graph with 99%-prefix rows).
+1. Sample $B$ anchors uniformly without replacement (`drop_last`).
+2. The pool is $\mathcal P_B=B\cup\bigcup_{i\in B}N(i)$, deduplicated. At $k=100$,
+   $B=64$ this is about 4.7k texts.
+3. The student encodes the pool once. This forward pass is essentially the
+   whole step cost.
 
 ---
 
 ## 3. Objective
 
-$$\mathcal{L} = \underbrace{\lambda_0\mathcal{L}_{r=0} +
-\lambda_1\mathcal{L}_{r=1}}_{\mathcal{L}_{\text{rel}}}
-+ \lambda_{\text{row}}\,\mathcal{L}_{\text{row}}$$
+$$\mathcal L=\lambda_{\rm row}\,\mathcal L_{\rm row}+\lambda_{\rm cal}\,\mathcal L_{\rm cal}$$
 
-The defaults are $\lambda_0=\lambda_1=0.5$, recovering the previous equal split.
-The coefficients are absolute: changing both by the same factor changes the
-relational objective's scale relative to $\mathcal L_{\rm row}$, and deleting
-one term does not rescale the other.
+### 3.1 $\mathcal L_{\rm row}$: every encoded row, local shape
 
-### 3.1 Graph scale, `r=1`
+$$\mathcal L_{\rm row}=\frac{1}{|R_B|}\sum_{j\in R_B}\mathrm{KL}\big(P^T_j|_{\Omega_j}\,\|\,P^S_j|_{\Omega_j}\big),\qquad \Omega_j=N(j)\cap\mathcal P_B,\quad R_B=\{j\in\mathcal P_B:|\Omega_j|\ge2\}.$$
 
-For each anchor, KL between the teacher's transition row and the student's
-softmax, over **the anchor's own candidate columns**, at $\tau_i$ on both sides.
-Because the `r=1` target *is* the transition row, the student reuses the
-bandwidth stored with that row — there is no temperature to choose.
+- Both sides are softmaxes at $\tau_j$, renormalized on $\Omega_j$.
+- Anchors are included. An anchor's $\Omega_i=N(i)$ is its whole row.
+- **What it pins (Lemma 1, Proposition 2).** A partial row has zero KL iff
+  $s^S_{ju}-s^T_{ju}=a_j$ on $\Omega_j$. A reciprocal edge forces $a_j=a_u$.
+  $\mathcal L_{\rm row}$ therefore fixes student cosines on graph edges up to
+  one offset per connected component of $G^\leftrightarrow$. No importance
+  correction is needed for the fixed points. The objective is still
+  inclusion-weighted (§5).
 
-### 3.2 Ambient scale, `r=0`
+### 3.2 $\mathcal L_{\rm cal}$: cross-neighbourhood levels
 
-For each anchor, KL over the **whole shared pool** at a single temperature,
-applied to teacher and student alike (same-temperature distillation, Hinton et
-al. 2015). That temperature is derived as the median bandwidth of the graph.
+$$\mathcal L_{\rm cal}=\frac{1}{|B|}\sum_{i\in B}\mathrm{KL}\big(Q^T_i\,\|\,Q^S_i\big),\qquad Q_i=\mathrm{softmax}_{u\in\mathcal P_B\setminus i}\big(s_{iu}/\bar\tau\big).$$
 
-The two groups deliberately use **different column sets**: `r=1` ranks *within*
-the neighbourhood, `r=0` calibrates similarity levels *across* the batch. Neither
-holds an opinion the other contradicts. The ambient group carries the same total
-weight as the graph group.
+- One temperature on both sides, $\bar\tau=\mathrm{median}_j\,\tau_j$ (logged as
+  `cal_temp`).
+- **What it pins.** It is the only term that scores non-edge pairs, and so the
+  offsets between reciprocal components. It is SEED-style, and it is the only
+  term that depends on the pool.
+- With a holdout, withheld pairs are also masked out of $Q_i$.
 
-### 3.3 Row supervision
+### 3.3 Derived quantities
 
-Non-anchor nodes `j` already in the shared pool are promoted to auxiliary rows:
+| quantity | value | set by |
+|---|---|---|
+| row columns $\Omega_j$ | $N(j)\cap\mathcal P_B$ | graph and pool |
+| supervised rows $R_B$ | pool texts with $\lvert\Omega_j\rvert\ge2$ | graph and pool |
+| row temperature $\tau_j$ | $(s^{(1)}_j-s^{(k)}_j)/\log k$ | teacher, `graph_k` |
+| calibration temperature $\bar\tau$ | median $\tau_j$ | teacher, `graph_k` |
 
-$$\mathcal{L}_{\text{row}} = \sum_j \nu_B(j)\, \mathrm{KL}\!\left(P^T_j|_{\Omega_j} \,\|\, p^S_j|_{\Omega_j}\right), \qquad \Omega_j = N_S(j) \cap \text{pool}$$
+### 3.4 Knobs
 
-with the dense transition row as target — row-kernel matching, not a trajectory
-likelihood — each row at its own stored bandwidth $\tau_j$, weighted uniformly.
-Batch anchors are excluded: $\mathcal{L}_{\text{rel}}$ already matches their row
-at `r=1`. Rows with fewer than two available columns are dropped.
+| flag | default | role |
+|---|---|---|
+| `--graph_k` | 100 | neighbourhood width, and (through $\tau_j$) row sharpness. Choose the smallest $k$ at which $G^\leftrightarrow$ is connected up to a few isolated nodes (Table 5) |
+| `--cal_weight` : `--row_weight` | 0.5 : 1.0 | $\lambda_{\rm cal}:\lambda_{\rm row}$. AdamW is nearly scale-invariant, so only the ratio matters (Table 6) |
 
-The row set is a deterministic function of the pool, so this term carries **no
-selection hyperparameter** and reuses computation $\mathcal{L}_{\text{rel}}$ has
-already paid for.
-
-### 3.4 Temperature ties
-
-None of these is a free parameter; the criterion rejects them by name.
-
-| | tied to |
-|:---|:---|
-| $\tau_1(i)$ | $\tau_i$ — the `r=1` target *is* the transition row |
-| $\tau_{\text{row}}(j)$ | $\tau_j$ — row targets are transition rows |
-| ambient | one temperature on both sides, the median $\tau_i$ |
-| relational group weights | explicit `r0_weight`/`r1_weight`, applied directly without normalization |
+The training setup is batch 64, 5 epochs, lr 3e-5 (min 3e-6), seed 42. With
+no GGPKD flags, a run is the method.
 
 ---
 
-## 4. Hyperparameters
+## 4. Ablation switches
 
-| | default | role |
-|:---|---:|:---|
-| `graph_k` | 200 | retrieval width **and**, through $\tau_i$, row sharpness |
-| `r0_weight` | 0.5 | independent coefficient $\lambda_0$ for ambient calibration |
-| `r1_weight` | 0.5 | independent coefficient $\lambda_1$ for graph-transition matching |
-| `row_weight` | 1.0 | independent coefficient $\lambda_{\text{row}}$ for auxiliary-row supervision |
+Each flag changes one thing and leaves the rest of §1–§3 at the method's
+value. The table and row numbers refer to `story.md` §5.
 
-Plus standard training settings (batch size, epochs, learning rate, seed).
+| flag | method value | ablation value | changes | story |
+|---|---|---|---|---|
+| `--method pointwise` | — | — | $1-\cos(Ws_i,t_i)$ with a trained linear map $W$; no relations | T3 row 1 |
+| `--batch_sampler` | `random` | `neighbor` | each batch is filled from one teacher graph neighbourhood; step and update counts are unchanged. Also valid with `--method pointwise` | T3 rows 2, 4 |
+| `--batch_local` | off | on | pool = the batch; loss is $\mathcal L_{\rm cal}$ only (`row_weight` becomes 0 unless set; a positive value is rejected) | T3 rows 3, 4; T2 |
+| `--row_set` | `all` | `anchors` | $\mathcal L_{\rm row}$ over anchor rows only | T3 row 5; T4 |
+| | | `non_anchors` | $\mathcal L_{\rm row}$ excludes anchors | T4 last row |
+| `--row_target` | `teacher` | `uniform` | same columns, equal mass on each | T3 row 7 |
+| `--row_columns` | `graph` | `random` | same width $\lvert\Omega_j\rvert$, columns drawn uniformly from the pool; target is the teacher softmax at $\tau_j$ over them. Not allowed with a holdout | T3 row 8 |
+| `--cal_weight` | 0.5 | 0 | $\mathcal L_{\rm row}$ only | T4 |
+| | | 0.25, 1.0 | ratio robustness | T6 |
+| `--row_weight` | 1.0 | 0 | $\mathcal L_{\rm cal}$ over the subgraph pool only | T4 |
+| `--holdout_edge_frac` | 0 | 0.2 | withhold edges from every term, for the held-out probe | T4 |
+| `--graph_k` | 100 | 25, 50, 200 | width and sharpness | T5 |
+| `--row_reweight` | off | on | weight row $j$ by $1/p_j$, with $p_j=1-\binom{N-\mathrm{indeg}(j)-1}{B}/\binom{N}{B}$ exact (GraphSAINT normalization). Needs `row_set` ≠ `anchors` and the random sampler | T6 |
+| `--neighbor_source` | `teacher` | `student` | $N(j)$ from the frozen base student's top-$k$; target values and $\tau_j$ stay the teacher's | T6 |
+| `--knn_mode` | `directed` | `mutual` | keep $u\in N(j)$ only if $j\in N(u)$; an emptied row falls back to its raw top-$k$ | T6 |
+| `--fixed_bandwidth` | off | on | one temperature, median $\tau_j$, for every row | T6 |
 
-> `graph_k` does two jobs. A sweep over it cannot separate neighbourhood width
-> from row sharpness — that is the price of not carrying a second constant, and it
-> must be stated rather than hidden. Too large a `k` measures the distance out of
-> the anchor's neighbourhood rather than the local decay, and the rows go uniform;
-> `scripts/ggpkd/pick_graph_k.py` reports the induced sharpness per `k` from one
-> teacher-embedding pass.
+---
+
+## 5. Stated properties
+
+- **Inclusion weighting.** Row $j$ enters a pool with probability
+  $p_j=1-\binom{N-\mathrm{indeg}(j)-1}{B}/\binom{N}{B}$, so $\mathcal L_{\rm row}$
+  is weighted by $p_j$. `--row_reweight` removes this weighting, and
+  `row_ess_ratio` logs the effective-sample-size cost.
+- **Anchor coverage.** With `drop_last`, $N \bmod B$ texts are not anchors in a
+  given epoch (49 at $N=13{,}553$, $B=64$). Every other row is seen whole once
+  per epoch.
+- **Logged per step** (`metrics.jsonl`): `loss_total`, `loss_cal`, `loss_row`,
+  `loss_cal_weighted`, `loss_row_weighted`, `row_share`, `pool_size`,
+  `cal_columns`, `row_count`, `row_eff_denom` (mean $\lvert\Omega_j\rvert$),
+  `row_exposed_mass` (mean teacher mass of $N(j)$ inside the pool, with p10/p90),
+  `row_teacher_entropy`, `row_kl_p50`/`p90`, `row_ess_ratio`. Table 2's column
+  evaluations are `row_count` × `row_eff_denom` plus $B$ × `cal_columns`.
+
+Code: `src/ggpkd/graph_builder.py` (graph, bandwidths, holdout, inclusion
+probabilities, reciprocal components), `src/data_utils/ggpkd_dataset.py` (pool
+collate), `src/criterions/ggpkd_distillation.py` (loss),
+`src/methods/ggpkd.py` (wiring), `config/ggpkd_config.py` (defaults and
+validation).

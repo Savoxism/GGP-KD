@@ -1,12 +1,13 @@
-"""The fixes behind the 2026-09-12 sweep's broken tables.
+"""The fixes behind the 2026-09-12 sweep's broken tables, kept on the table scripts.
 
-* student_knn once trained on a teacher graph rebuilt under the student's name;
 * pair_order read exactly 1.0 or 0.0 on a rectangular, sparse held-out mask;
-* Stage 1.1b and 1.3 had no code;
-* the runner overwrote multi-pair CSVs and could not re-run a single arm.
+* the runner overwrote multi-pair CSVs and could not re-run a single arm;
+* every table script must plan exactly the arms story.md §5 names, with no flag
+  the rewritten CLI no longer accepts.
 """
 
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -16,273 +17,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from config import GGPKDConfig
-from src.criterions.ggpkd_distillation import GGPKDDistillation
 from src.distill.geometry import pair_order_accuracy
-from src.ggpkd.graph_builder import build_or_load_ggpkd_artifact
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_BIN = REPO_ROOT / ".venv" / "bin" / "python"
 
 
-def _inputs(batch=4, candidates=12, dim=16, n_items=60):
-    torch.manual_seed(0)
-    probs = torch.rand(batch, 1, candidates)
-    probs[:, :, candidates // 2 :] = 0.0
-    probs /= probs.sum(-1, keepdim=True)
-    candidate_idx = torch.stack(
-        [torch.randperm(n_items)[:candidates] for _ in range(batch)]
-    )
-    for row in range(batch):
-        candidate_idx[row][candidate_idx[row] == row] = (row + 31) % n_items
-    return {
-        "teacher": torch.randn(n_items, dim),
-        "anchor": torch.randn(batch, dim, requires_grad=True),
-        "candidates": torch.randn(batch * candidates, dim, requires_grad=True),
-        "probs": probs,
-        "candidate_idx": candidate_idx,
-        "anchor_idx": torch.arange(batch),
-        "graph": {
-            "transition_neighbors": torch.randint(0, n_items, (n_items, 8)).int(),
-            "transition_probs": torch.rand(n_items, 8).softmax(-1),
-            "row_temps": torch.full((n_items,), 0.05),
-        },
-    }
-
-
-def _forward(criterion, data):
-    criterion.use_row_loss = True
-    return criterion(
-        data["anchor"],
-        data["candidates"],
-        data["probs"],
-        candidate_idx=data["candidate_idx"],
-        anchor_idx=data["anchor_idx"],
-    )
-
-
 # --------------------------------------------------------------------------- #
-# Stage 1.3 -- uniform target
-# --------------------------------------------------------------------------- #
-
-
-def test_uniform_target_changes_the_values_not_the_columns():
-    data = _inputs()
-    metrics = {}
-    for target in ("transition", "uniform"):
-        criterion = GGPKDDistillation(
-            teacher_embeddings=data["teacher"],
-            relation_target=target,
-            row_weight=1.0,
-            **data["graph"],
-        )
-        loss, metrics[target] = _forward(criterion, data)
-        assert torch.isfinite(loss)
-    assert metrics["uniform"]["candidates_per_anchor"] == pytest.approx(
-        metrics["transition"]["candidates_per_anchor"]
-    )
-    assert metrics["uniform"]["loss_amb"] == pytest.approx(
-        metrics["transition"]["loss_amb"]
-    )
-    assert metrics["uniform"]["loss_nbr"] != pytest.approx(
-        metrics["transition"]["loss_nbr"]
-    )
-
-
-def test_uniform_target_is_differentiable():
-    data = _inputs()
-    criterion = GGPKDDistillation(
-        teacher_embeddings=data["teacher"],
-        relation_target="uniform",
-        row_weight=1.0,
-        **data["graph"],
-    )
-    loss, _ = _forward(criterion, data)
-    loss.backward()
-    assert torch.isfinite(data["anchor"].grad).all()
-
-
-# --------------------------------------------------------------------------- #
-# Stage 1.1b -- random row centers
-# --------------------------------------------------------------------------- #
-
-
-def test_random_row_centers_keep_each_rows_width_and_never_pick_the_row_itself():
-    data = _inputs()
-    criterion = GGPKDDistillation(
-        teacher_embeddings=data["teacher"],
-        row_weight=1.0,
-        row_centers="random",
-        **data["graph"],
-    )
-    allowed = torch.zeros(3, 10, dtype=torch.bool)
-    allowed[0, [1, 2]] = True
-    allowed[1, [0, 3, 4, 5]] = True
-    allowed[2, [7, 8, 9]] = True
-    source_positions = torch.tensor([0, 1, 2])
-    torch.manual_seed(1)
-    drawn, target = criterion._random_row_columns(
-        source_positions,
-        torch.tensor([5, 6, 7]),
-        torch.arange(20, 30),
-        allowed,
-        torch.full((3, 1), 0.05),
-    )
-    assert drawn.sum(dim=1).tolist() == [2, 4, 3]
-    assert not drawn[torch.arange(3), source_positions].any()
-    torch.testing.assert_close(target.sum(dim=1), torch.ones(3))
-    assert bool((target[~drawn] == 0).all())
-
-
-def test_random_row_centers_need_the_teacher_bank():
-    data = _inputs()
-    with pytest.raises(ValueError, match="teacher bank"):
-        GGPKDDistillation(
-            teacher_embeddings=None,
-            row_weight=1.0,
-            row_centers="random",
-            calibration_mode="none",
-            **data["graph"],
-        )
-
-
-def test_random_row_centers_move_only_the_row_term():
-    data = _inputs()
-    metrics = {}
-    for centers in ("teacher", "random"):
-        criterion = GGPKDDistillation(
-            teacher_embeddings=data["teacher"],
-            row_weight=1.0,
-            row_centers=centers,
-            **data["graph"],
-        )
-        torch.manual_seed(2)
-        loss, metrics[centers] = _forward(criterion, data)
-        assert torch.isfinite(loss)
-    assert metrics["random"]["row_count"] > 0
-    assert metrics["random"]["loss_nbr"] == pytest.approx(
-        metrics["teacher"]["loss_nbr"]
-    )
-    assert metrics["random"]["loss_row"] != pytest.approx(
-        metrics["teacher"]["loss_row"]
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Config guards
-# --------------------------------------------------------------------------- #
-
-
-def test_student_neighbours_are_the_full_objective_default():
-    config = GGPKDConfig()
-    assert config.neighbor_source == "student"
-    assert config.relation_target == "transition"
-    assert config.calibration_mode == "pool"
-    assert config.row_weight == 1.0
-
-    # Teacher-kNN remains a one-flag ablation.
-    assert GGPKDConfig(neighbor_source="teacher").neighbor_source == "teacher"
-
-
-def test_random_row_centers_are_refused_without_the_row_term():
-    with pytest.raises(ValueError, match="row_weight > 0"):
-        GGPKDConfig(row_centers="random", row_weight=0.0)
-
-
-# --------------------------------------------------------------------------- #
-# Stage 2B -- student_knn graph
-# --------------------------------------------------------------------------- #
-
-
-def _sorted_neighbours(artifact):
-    return artifact["transition_neighbors"].sort(dim=1).values
-
-
-def test_student_graph_takes_columns_from_the_student_and_temperatures_from_the_teacher(
-    tmp_path,
-):
-    torch.manual_seed(0)
-    teacher = torch.randn(80, 16)
-    student = torch.randn(80, 12)
-    common = {"log_dir": str(tmp_path / "logs"), "graph_k": 8, "knn_mode": "directed"}
-    teacher_graph = build_or_load_ggpkd_artifact(
-        teacher, cache_path=str(tmp_path / "teacher.pt"), **common
-    )
-    student_graph = build_or_load_ggpkd_artifact(
-        teacher,
-        cache_path=str(tmp_path / "student.pt"),
-        neighbor_source="student:test",
-        neighbor_embeddings=lambda: student,
-        **common,
-    )
-    normalized = F.normalize(student, dim=-1)
-    cosine = normalized @ normalized.t()
-    cosine.fill_diagonal_(-float("inf"))
-    expected = cosine.topk(8, dim=1).indices.sort(dim=1).values
-    assert torch.equal(_sorted_neighbours(student_graph), expected)
-    assert not torch.equal(
-        _sorted_neighbours(student_graph), _sorted_neighbours(teacher_graph)
-    )
-    torch.testing.assert_close(student_graph["row_temps"], teacher_graph["row_temps"])
-
-    # The student selects columns; the teacher supplies every target value.
-    teacher_norm = F.normalize(teacher, dim=-1)
-    selected = student_graph["transition_neighbors"]
-    selected_embeddings = teacher_norm[selected]
-    teacher_scores = torch.einsum(
-        "nd,nkd->nk", teacher_norm, selected_embeddings
-    )
-    expected_probs = torch.softmax(
-        teacher_scores / student_graph["row_temps"].unsqueeze(1), dim=-1
-    )
-    torch.testing.assert_close(
-        student_graph["transition_probs"], expected_probs, rtol=1e-5, atol=1e-6
-    )
-
-
-def test_a_teacher_graph_never_loads_under_the_student_name(tmp_path):
-    """The 2026-09-12 failure: a teacher artifact sat at the student arm's path."""
-    torch.manual_seed(0)
-    teacher = torch.randn(80, 16)
-    student = torch.randn(80, 12)
-    path = tmp_path / "graph_student_knn.pt"
-    common = {"log_dir": str(tmp_path / "logs"), "graph_k": 8, "knn_mode": "directed"}
-    teacher_graph = build_or_load_ggpkd_artifact(teacher, cache_path=str(path), **common)
-    # An artifact written before the key existed carries no neighbour source.
-    stale = torch.load(path, weights_only=False)
-    stale["metadata"].pop("neighbor_source")
-    torch.save(stale, path)
-
-    calls = []
-
-    def encode():
-        calls.append(1)
-        return student
-
-    rebuilt = build_or_load_ggpkd_artifact(
-        teacher,
-        cache_path=str(path),
-        neighbor_source="student:test",
-        neighbor_embeddings=encode,
-        **common,
-    )
-    assert calls == [1]
-    assert rebuilt["metadata"]["neighbor_source"] == "student:test"
-    assert not torch.equal(_sorted_neighbours(rebuilt), _sorted_neighbours(teacher_graph))
-
-    # A matching artifact loads without encoding the student again.
-    build_or_load_ggpkd_artifact(
-        teacher,
-        cache_path=str(path),
-        neighbor_source="student:test",
-        neighbor_embeddings=encode,
-        **common,
-    )
-    assert calls == [1]
-
-
-# --------------------------------------------------------------------------- #
-# Stage 2E -- pair_order on [anchors, corpus]
+# pair_order on [anchors, corpus]
 # --------------------------------------------------------------------------- #
 
 
@@ -325,31 +67,20 @@ def test_pair_order_scores_only_the_masked_columns_of_each_row():
 
 
 # --------------------------------------------------------------------------- #
-# Runner and export
+# Export
 # --------------------------------------------------------------------------- #
 
 
-def test_export_merges_rows_by_pair_arm_and_seed(tmp_path):
-    root = tmp_path / "run"
-    (root / "runs" / "student_knn" / "seed_42").mkdir(parents=True)
-    (root / "run_config.tsv").write_text("commit\tabc123\n", encoding="utf-8")
-    out = tmp_path / "results.csv"
-    with out.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["experiment", "pair", "arm", "seed", "status"])
-        writer.writeheader()
-        for arm in ("student_knn", "teacher"):
-            writer.writerow(
-                {"experiment": "stage2b_ladder", "pair": "p", "arm": arm, "seed": "42", "status": "ok"}
-            )
-    subprocess.run(
+def _export(root, out, pair, experiment="table1_main"):
+    return subprocess.run(
         [
             sys.executable,
             "scripts/exp/export_runs.py",
             str(root),
             "--experiment",
-            "stage2b_ladder",
+            experiment,
             "--pair",
-            "p",
+            pair,
             "--out",
             str(out),
             "--merge",
@@ -357,19 +88,115 @@ def test_export_merges_rows_by_pair_arm_and_seed(tmp_path):
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
+        text=True,
     )
+
+
+def test_export_merges_rows_by_pair_arm_and_seed(tmp_path):
+    """Table 1 exports two pairs into one CSV; the second must not erase the first."""
+    out = tmp_path / "results.csv"
+    for pair in ("bge_m3_to_minilmv2_h768", "qwen3_4b_to_bert_base"):
+        root = tmp_path / pair / "run"
+        (root / "runs" / "ours" / "seed_42").mkdir(parents=True)
+        (root / "run_config.tsv").write_text("commit\tabc123\n", encoding="utf-8")
+        _export(root, out, pair)
+    # A re-run of one pair replaces its row and keeps the other pair's.
+    _export(tmp_path / "qwen3_4b_to_bert_base" / "run", out, "qwen3_4b_to_bert_base")
+
     with out.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert sorted(row["arm"] for row in rows) == ["student_knn", "teacher"]
-    fresh = next(row for row in rows if row["arm"] == "student_knn")
-    assert fresh["status"] == "no_manifest"
-    assert fresh["git_commit"] == "abc123"
+    assert sorted(row["pair"] for row in rows) == [
+        "bge_m3_to_minilmv2_h768",
+        "qwen3_4b_to_bert_base",
+    ]
+    assert all(row["arm"] == "ours" for row in rows)
+    assert all(row["status"] == "no_manifest" for row in rows)
+    assert all(row["git_commit"] == "abc123" for row in rows)
+
+
+def test_export_reads_the_new_config_metric_and_graph_columns(tmp_path):
+    root = tmp_path / "run"
+    seed_dir = root / "runs" / "ours" / "seed_42"
+    seed_dir.mkdir(parents=True)
+    manifest = {
+        "run_id": "r1",
+        "git": {"sha": "deadbeef"},
+        "config": {
+            "distill_method": "ggpkd",
+            "graph_k": 100,
+            "cal_weight": 0.5,
+            "row_weight": 1.0,
+            "row_set": "all",
+            "row_target": "teacher",
+            "row_columns": "graph",
+            "row_reweight": False,
+            "batch_local": False,
+            "batch_sampler": "random",
+            "fixed_bandwidth": False,
+        },
+        "artifact": {
+            "metadata": {
+                "graph_k": 100,
+                "bandwidth": "median",
+                "knn_mode": "directed",
+                "neighbor_source": "teacher",
+                "holdout_edge_frac": 0.2,
+                "holdout_seed": 12345,
+            },
+            "graph_stats": {
+                "reciprocal_components": 15,
+                "reciprocal_isolated": 13,
+                "reciprocal_largest_frac": 0.99,
+                "reciprocity": 0.41,
+                "target_kl_uniform": 0.3,
+            },
+        },
+    }
+    (seed_dir / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+    epoch = {
+        "epoch": 5,
+        "train": {
+            "loss_total": 1.5,
+            "loss_cal": 0.7,
+            "loss_row": 1.1,
+            "pool_size": 4700.0,
+            "row_exposed_mass": 0.61,
+            "peak_memory_mb": 14438.0,
+            "encoded_texts_cum": 123456,
+        },
+    }
+    (seed_dir / "epochs.jsonl").write_text(json.dumps(epoch) + "\n", encoding="utf-8")
+    out = tmp_path / "results.csv"
+    _export(root, out, "p", experiment="table3_exposure")
+
+    with out.open(newline="", encoding="utf-8") as handle:
+        (row,) = list(csv.DictReader(handle))
+    assert row["cfg_graph_k"] == "100"
+    assert row["cfg_cal_weight"] == "0.5"
+    assert row["cfg_row_set"] == "all"
+    assert row["cfg_batch_local"] == "False"
+    assert row["cfg_holdout_seed"] == "12345"
+    # The artifact wins over the config for how the graph was built.
+    assert row["cfg_fixed_bandwidth"] == "True"
+    assert row["train_loss_cal"] == "0.7"
+    assert row["train_row_exposed_mass"] == "0.61"
+    assert row["train_encoded_texts_cum"] == "123456"
+    assert row["graph_reciprocal_components"] == "15"
+    assert row["graph_target_kl_uniform"] == "0.3"
+    assert row["git_commit"] == "deadbeef"
+    for gone in ("cfg_support_policy", "train_loss_rel", "train_candidates_per_anchor"):
+        assert gone not in row
+
+
+# --------------------------------------------------------------------------- #
+# Runner
+# --------------------------------------------------------------------------- #
 
 
 def _run_arms(arms):
     corpus = "data/train_set/merged_3_data_5k_each.csv"
     command = f"""
-source {REPO_ROOT / 'scripts/exp/lib/run_arms.sh'}
+source {REPO_ROOT / "scripts/exp/lib/run_arms.sh"}
 GRAPH_SPEC='main|{corpus}|
 other|{corpus}|'
 ARMS_SPEC='a|main|ggpkd|
@@ -383,7 +210,11 @@ PYTHON_BIN={PYTHON_BIN}
 run_arms {REPO_ROOT} runner_validation
 """
     return subprocess.run(
-        ["bash", "-c", command], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+        ["bash", "-c", command],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -401,68 +232,32 @@ def test_runner_rejects_an_arm_the_sweep_does_not_define():
     assert "does not define" in result.stderr
 
 
-@pytest.mark.parametrize(
-    ("script", "extra_env", "expected", "absent"),
-    [
-        (
-            "stage1_deletions.sh",
-            {},
-            ["runs:   5", "no_r0", "no_r1", "row_centers_random", "uniform_target"],
-            ["skipping arm"],
-        ),
-        (
-            "stage2b_ladder.sh",
-            {},
-            [
-                "runs:   4",
-                "graph=student_knn",
-                "objective: full (r=0 + r=1 + row)",
-                "student_knn                        graph=student_knn",
-                "teacher_knn                        graph=teacher_knn",
-            ],
-            [
-                "qwen3_4b_to_bert_base",
-                "--row_weight 0",
-                "--no_ambient",
-                "--calibration_mode none",
-            ],
-        ),
-        (
-            "stage2c_dose_response.sh",
-            {},
-            ["runs:   5", "full_neighbor"],
-            ["batch_size", "stage2c2"],
-        ),
-        (
-            "stage2d_components.sh",
-            {},
-            ["runs:   4", "full", "graph=main_holdout"],
-            [],
-        ),
-        ("stage3_main_table.sh", {}, ["pairs run here: none"], ["main table -- pair"]),
-        (
-            "stage3g_lambda_sensitivity.sh",
-            {},
-            [
-                "runs:   6",
-                "lambda0_0p25",
-                "--r0_weight 0.25 --r1_weight 0.5 --row_weight 1.0",
-                "lambda1_1p0",
-                "--r0_weight 0.5 --r1_weight 1.0 --row_weight 1.0",
-                "lambda_row_2p0",
-                "--r0_weight 0.5 --r1_weight 0.5 --row_weight 2.0",
-                "all three loss groups remain active",
-            ],
-            ["--r0_weight 0 --", "--r1_weight 0 --", "--row_weight 0\n"],
-        ),
-    ],
-)
-def test_stage_dry_runs_plan_the_fixed_matrix(script, extra_env, expected, absent):
+# --------------------------------------------------------------------------- #
+# Table dry runs
+# --------------------------------------------------------------------------- #
+
+
+def _planned(output):
+    """{arm: (graph, method, flags)} from run_arms' DRY_RUN listing."""
+    arms = {}
+    for line in output.splitlines():
+        if " graph=" not in line or " method=" not in line:
+            continue
+        label, rest = line.strip().split(None, 1)
+        graph = rest.split("graph=", 1)[1].split()[0]
+        method = rest.split("method=", 1)[1].split()[0]
+        flags = rest.split("flags:", 1)[1].strip()
+        arms[label] = (graph, method, flags)
+    return arms
+
+
+def _table(script, **extra_env):
     env = {
         **os.environ,
         "DRY_RUN": "1",
         "GPUS": "0",
-        "GRAPH_K": "200",
+        "GRAPH_K": "100",
+        "SEEDS": "42",
         "PYTHON_BIN": str(PYTHON_BIN),
         "RUN_ID": "stage-fix-test",
         **extra_env,
@@ -477,31 +272,73 @@ def test_stage_dry_runs_plan_the_fixed_matrix(script, extra_env, expected, absen
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    for text in expected:
-        assert text in output
-    for text in absent:
-        assert text not in output
+    return result.stdout, output
 
 
-def test_lambda_sensitivity_rejects_a_zero_weight():
+TABLE_MATRIX = {
+    "table3_exposure.sh": {
+        "pointwise_random": ("main", "pointwise", ""),
+        "pointwise_neighbor": ("main", "pointwise", "--batch_sampler neighbor"),
+        "in_batch_random": ("main", "ggpkd", "--batch_local"),
+        "in_batch_neighbor": ("main", "ggpkd", "--batch_local --batch_sampler neighbor"),
+        "anchor_rows": ("main", "ggpkd", "--row_set anchors"),
+        "ours": ("main", "ggpkd", ""),
+        "uniform_target": ("main", "ggpkd", "--row_target uniform"),
+        "random_columns": ("main", "ggpkd", "--row_columns random"),
+    },
+    "table4_loss_terms.sh": {
+        "ours": ("main_holdout", "ggpkd", ""),
+        "cal_off": ("main_holdout", "ggpkd", "--cal_weight 0"),
+        "row_off": ("main_holdout", "ggpkd", "--row_weight 0"),
+        "anchors_only": ("main_holdout", "ggpkd", "--row_set anchors"),
+        "anchors_excluded": ("main_holdout", "ggpkd", "--row_set non_anchors"),
+    },
+    "table6_robustness.sh": {
+        "cal_0p25": ("main", "ggpkd", "--cal_weight 0.25"),
+        "cal_1p0": ("main", "ggpkd", "--cal_weight 1.0"),
+        "row_reweight": ("main", "ggpkd", "--row_reweight"),
+        "student_knn": ("student", "ggpkd", ""),
+        "mutual_knn": ("mutual", "ggpkd", ""),
+        "global_tau": ("median_tau", "ggpkd", ""),
+    },
+    "table2_cost.sh": {
+        "pointwise": ("main", "pointwise", ""),
+        "in_batch": ("main", "ggpkd", "--batch_local"),
+        "ours": ("main", "ggpkd", ""),
+    },
+}
+
+
+@pytest.mark.parametrize("script", sorted(TABLE_MATRIX))
+def test_table_dry_runs_plan_the_fixed_matrix(script):
+    stdout, _ = _table(script)
+    expected = TABLE_MATRIX[script]
+    assert _planned(stdout) == expected
+    assert f"runs:   {len(expected)}" in stdout
+
+
+def test_seeds_multiply_the_run_count():
+    stdout, _ = _table("table3_exposure.sh", SEEDS="42,43,44")
+    assert "runs:   24" in stdout
+
+
+def test_table4_trains_every_arm_on_the_same_holdout_graph():
+    stdout, _ = _table("table4_loss_terms.sh")
+    assert "graphs: 1" in stdout
+    assert "holdout 0.2 (seed 12345)" in stdout
+
+
+def test_table4_refuses_to_run_without_a_holdout():
     env = {
         **os.environ,
         "DRY_RUN": "1",
         "GPUS": "0",
-        "GRAPH_K": "200",
+        "GRAPH_K": "100",
         "PYTHON_BIN": str(PYTHON_BIN),
-        "LAMBDA0_VALUES": "0",
+        "HOLDOUT_FRAC": "0",
     }
     result = subprocess.run(
-        [
-            "bash",
-            str(
-                REPO_ROOT
-                / "scripts"
-                / "exp"
-                / "stage3g_lambda_sensitivity.sh"
-            ),
-        ],
+        ["bash", str(REPO_ROOT / "scripts" / "exp" / "table4_loss_terms.sh")],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
@@ -509,4 +346,44 @@ def test_lambda_sensitivity_rejects_a_zero_weight():
         check=False,
     )
     assert result.returncode == 2
-    assert "zero belongs to loss decomposition" in result.stderr
+    assert "need a holdout" in result.stderr
+
+
+def test_table6_varies_one_thing_per_arm_and_names_its_reference():
+    stdout, output = _table("table6_robustness.sh")
+    assert "graphs: 4" in stdout
+    assert "Table 5's graph_k_100 run" in output
+    planned = _planned(stdout)
+    # Graph variants carry no objective flags; objective variants use the main graph.
+    for arm, (graph, _, flags) in planned.items():
+        assert (graph == "main") == bool(flags), arm
+
+
+def test_table2_forces_one_job_per_gpu():
+    stdout, output = _table("table2_cost.sh", JOBS_PER_GPU="3")
+    assert "1 job(s) per GPU" in stdout
+    assert "JOBS_PER_GPU=3 ignored" in output
+
+
+def test_table1_runs_each_pair_into_one_merged_csv():
+    stdout, _ = _table("table1_main.sh")
+    assert "Table 1 -- pair bge_m3_to_minilmv2_h768" in stdout
+    assert "Table 1 -- pair qwen3_4b_to_bert_base" in stdout
+    assert stdout.count("runs:   1") == 2
+    assert "results/table1_main/bge_m3_to_minilmv2_h768/stage-fix-test" in stdout
+    assert "results/table1_main/qwen3_4b_to_bert_base/stage-fix-test" in stdout
+
+
+def test_table1_skips_the_pair_table5_already_measured():
+    stdout, output = _table(
+        "table1_main.sh", PAIRS="qwen3_0_6b_to_minilmv2_h384,bge_m3_to_minilmv2_h768"
+    )
+    assert "skipping qwen3_0_6b_to_minilmv2_h384" in output
+    assert stdout.count("runs:   1") == 1
+
+
+def test_table4_heldout_dry_run_scores_nothing():
+    stdout, _ = _table("table4_heldout.sh")
+    assert "graph_main_holdout.pt" in stdout
+    assert "heldout_same_component" in stdout
+    assert "DRY_RUN: nothing scored" in stdout

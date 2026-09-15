@@ -1,282 +1,66 @@
 import math
 
-from src.criterions.ggpkd_distillation import (
-    CALIBRATION_MODES,
-    RELATION_TARGET_ALIASES,
-    RELATION_TARGETS,
-    ROW_CENTERS,
-)
+from src.criterions.ggpkd_distillation import ROW_COLUMNS, ROW_SETS, ROW_TARGETS
 from src.data_utils.batch_samplers import BATCH_SAMPLERS
 from src.ggpkd.graph_builder import KNN_MODES, NEIGHBOR_SOURCES
-from src.ggpkd.policy import SUPPORT_POLICIES
 
 from .base_config import BaseConfig
 
 
 class GGPKDConfig(BaseConfig):
+    """GGPKD as defined in story.md §2, with the ablation switches of Tables 3-6.
+
+    Every switch defaults to the method's value, so a run with no GGPKD flags is
+    the method.
+    """
+
     distill_method = "ggpkd"
 
-    # Keep the no-CLI defaults aligned with the pair selected in
-    # notebooks/train_colab_topk_no_neg.ipynb.
     student_model_name = "nreimers/MiniLMv2-L6-H384-distilled-from-BERT-Base"
     student_dtype = "float32"
     teacher_model_name = "Qwen/Qwen3-Embedding-0.6B"
     teacher_dtype = "float32"
-
     student_special_token = "##"
     teacher_special_token = "G"
 
-    # ---- Objective -----------------------------------------------------------
-    # No student temperature on the diffusion ladder is a free parameter. The
-    # criterion rejects scale_temps / broad_scale_temps / row_temp /
-    # direct_student_temp and derives all of them:
-    #   tau_1(i) = tau_i     the r=1 target IS the transition row, so the student
-    #                        reuses the per-row bandwidth stored in the graph;
-    #   tau_r = sqrt(r) tau_1   the spread of a diffusion grows as sqrt of its
-    #                        time, so scale r is matched at the resolution its own
-    #                        target already has. In the fixed-bandwidth baseline
-    #                        at 0.05 this is
-    #                        (0.0707, 0.200) for r = 2, 4 -- the values that were
-    #                        previously written out by hand as (0.07, 0.10);
-    #   tau_row(j) = tau_j   row targets are transition rows, so each supervised
-    #                        row reuses its stored graph bandwidth;
-    #   direct scale         one temperature on both teacher and student side
-    #                        (Hinton et al. 2015 convention), derived at startup
-    #                        as the median graph bandwidth.
-    # No student temperature is left to choose. In-batch sharing is part of the
-    # method definition and is always enabled when corpus indices are available.
-
-    # ---- Direct Scale (r=0) --------------------------------------------------
-    # r0_weight and r1_weight are independent non-negative coefficients for the
-    # ambient and graph groups. They are applied directly, with no normalization;
-    # the defaults preserve the previous (0.5, 0.5) full objective. The r=0
-    # temperature is
-    # derived at startup as the median graph bandwidth: the ambient target is the
-    # transition-row construction with sparsification removed, so the graph's
-    # typical bandwidth is its natural scale and no fixed temperature has to be
-    # retuned across teachers.
-
-    # ---- Ablation switches ---------------------------------------------------
-    # Every one of these sits at the method's value. They exist so an ablation
-    # arm is one CLI flag away from the full model instead of a branch, and so a
-    # run manifest records which arm produced a number.
-    #
-    # support_policy  which columns the diffusion quota is spent on (S1):
-    #                 topk (method) / proportional / uniform / local_topk.
-    #                 local_topk is only for the clean no-diffusion control: it
-    #                 selects the quota under P^1 while preserving the full
-    #                 artifact and therefore the method's graph/ambient balance.
-    # relation_target what the selected columns are supervised *against* (S3):
-    #                 transition (method, the teacher transition row) or direct
-    #                 (the teacher's raw cosine over the same columns). The former
-    #                 spelling `diffusion` still resolves to `transition`: at one
-    #                 hop there is no composition step left for the name to mean.
-    # knn_mode        which retrieval edges survive into the graph (G1):
-    #                 directed (method) / mutual / symmetrized. `directed`
-    #                 keeps each node's raw top-k under the configured neighbour
-    #                 source, so every row has exactly graph_k columns.
-    #                 The mutual filter was the earlier default; it is kept as
-    #                 an arm because E2 measured it at 73.93 against directed's
-    #                 74.29 on the minimal objective (runs/exp2/results.csv),
-    #                 and a filter that costs accuracy has to justify itself.
-    # batch_local     the S1 baseline (batch-local relational KD): no graph, no
-    #                 candidate draw, no rows -- each anchor is scored against the
-    #                 texts that happen to share its minibatch. Implies
-    #                 relation_target="ambient_only", which main.py sets for it.
-    #                 Deliberately NOT encoder-budget-matched: it encodes 2B texts
-    #                 per step against the method's B + unique candidates, and that
-    #                 gap is the point, not a flaw. The budget-matched counterpart
-    #                 is diffusion_quota=0 with the whole quota spent on uniform
-    #                 corpus draws, which needs no flag of its own.
-    support_policy = "topk"
-    # relation_target also accepts `uniform` (Stage 1.3): the transition row's
-    # columns and tau_i with equal mass on every retrieved neighbour.
-    relation_target = "transition"
-    # Calibration is orthogonal to the graph target (S4). `pool` is the method:
-    # the ambient KL over the current batch's shared candidate union. `none`
-    # deletes the r=0 scale; `--no_ambient` is its CLI spelling.
-    calibration_mode = "pool"
-    r0_weight = 0.5
-    r1_weight = 0.5
-    knn_mode = "directed"
-    batch_local = False
-    # neighbor_source whose kNN decides a row's columns:
-    #                 student (method) -- the frozen base student's own top-k --
-    #                 or teacher (ablation). In either case the teacher supplies
-    #                 the cosine values, transition targets and row temperatures;
-    #                 only the compared texts come from the neighbour source.
-    # row_centers     which columns L_row scores an extra anchor j against
-    #                 (Stage 1.1b): teacher-valued graph row (method, N_j within the pool) or
-    #                 random (as many pool columns, drawn uniformly).
-    neighbor_source = "student"
-    row_centers = "teacher"
-
-    # ---- Motivation study: batch composition, edge holdout -------------------
-    # These three exist for the controlled studies in scripts/exp/ and sit at the
-    # method's value, so a normal run is unaffected by their presence.
-    #
-    # batch_sampler       how a mini-batch is composed (E1, batch intervention).
-    #                     `random` is the method and the only setting under which
-    #                     the batches are i.i.d.; `teacher_neighbor` fills each
-    #                     batch from one teacher neighbourhood, `teacher_diverse`
-    #                     spreads it across distant ones. Both are label-free.
-    #                     They exist to test whether batch composition changes the
-    #                     supervision objective, which it can only do for a loss
-    #                     whose support is the batch.
-    # holdout_edge_frac   fraction of cached graph edges withheld from every
-    #                     training support (E3). The withheld edges are stored in
-    #                     the artifact so a post-hoc evaluation can ask whether the
-    #                     student recovered relations it was never supervised on.
-    #                     0 is the method: nothing withheld.
-    # holdout_seed        which edges. Separate from `seed` on purpose: the split
-    #                     must be identical across seeds and across arms, or the
-    #                     held-out evaluation is not measuring the same relations.
-    batch_sampler = "random"
+    # ---- Graph ---------------------------------------------------------------
+    # N(j) is the directed top-graph_k of j under `neighbor_source`; targets and
+    # bandwidths are always the teacher's. graph_k sets both the neighbourhood and,
+    # through tau_j = (s(1) - s(k)) / log k, how sharp each row is.
+    graph_k = 100
+    neighbor_source = "teacher"  # student: Table 6
+    knn_mode = "directed"  # mutual: Table 6
+    fixed_bandwidth = False  # one median tau for every row: Table 6
+    # Fraction of graph edges withheld from all training terms, for the held-out
+    # relations in Table 4. Independent of `seed`, so every arm withholds the same.
     holdout_edge_frac = 0.0
     holdout_seed = 12345
 
-    # ---- Teacher Graph -------------------------------------------------------
-    graph_k = 200
-    # Bandwidth. Each transition row uses tau_i = s_i(1) - s_i(k): the similarity
-    # span of its own retrieved neighbourhood, so the k-th neighbour sits exactly one
-    # nat below the nearest for every node. This replaced a target-perplexity solve,
-    # for two reasons. It keeps the property that ruled out a single fixed
-    # temperature -- the row is exactly invariant to s -> a*s + b, because the
-    # bandwidth scales with the similarities and a softmax is shift-invariant -- and
-    # it costs one subtraction instead of a per-row bisection. The solve it replaced
-    # also did not deliver what it promised: it ran on the mutual-filtered neighbour
-    # list, where 18.9% of the production corpus had degree at or below perplexity
-    # 30, so those rows never reached the target entropy and were solved against
-    # their own ceiling instead. There is no target to miss here.
-    #
-    # graph_k therefore sets both the neighbourhood and its sharpness. That is one
-    # knob doing two jobs: a sweep over it cannot separate the two effects, which is
-    # the price of not having a second constant.
-    fixed_bandwidth = False
-    # ---- Row Supervision -----------------------------------------------------
-    # L_row promotes the graph-selected pool columns (not the hard/uniform
-    # negatives of an arm) to auxiliary rows and matches each one's complete
-    # available transition row, weighted uniformly. Batch anchors are excluded:
-    # L_rel already matches their transition row as its r=1 target. The row set is a
-    # deterministic function of the candidate pool, so this term costs no selection
-    # hyperparameter -- row_weight is the only knob L_row has.
-    #
-    # Four alternatives were implemented and measured on Qwen3-0.6B -> MiniLMv2-H384
-    # (seed 42, 5 epochs, row_weight 1.0); all lost and were deleted. The code is in
-    # git history at b1f683b and earlier, and the numbers are in
-    # docs/experiments/qwen-minilm-tuning.md:
-    #
-    #   non-backtracking walk selection   74.88, ties uniform closure but costs
-    #                                     num_walks + walk_length, and the sampler
-    #                                     had to inject visited nodes into the draw
-    #   weight by exposed mass m_B(j)     74.76, squares a selection bias that is
-    #                                     already mass-proportional
-    #   weight by 1/c_B(j)                inert, c_B(j)=1 for ~99% of rows at this
-    #                                     corpus and batch size
-    #   ambient r=0 term per row          -0.30 out-of-domain, the benchmarks it was
-    #                                     meant to calibrate
-    #
-    # uniform closure:                    74.86 at row_start_epoch 2, 74.82 at 1
+    # ---- Objective: L = row_weight * L_row + cal_weight * L_cal -------------------
+    # AdamW is nearly scale-invariant, so only the ratio is a real knob (Table 6).
+    cal_weight = 0.5
     row_weight = 1.0
 
-    # ---- Truncation ----------------------------------------------------------
-    # 0 is the method: no truncation. The support of anchor i is its whole
-    # retrieved row N_i = top-k(i), every column at its teacher probability, so
-    # every row has exactly graph_k columns and nothing about the target depends
-    # on a numerical constant.
-    #
-    # A positive value restores the mass-prefix arm, where each row keeps the
-    # smallest prefix carrying 1 - tolerance of its mass. That is a real
-    # truncation with a stated cost: discarding mass delta gives exactly
-    # TV(p, ptilde) = delta and KL(ptilde || p) = -log(1 - delta), so the
-    # tolerance bounds the perturbation of the targets in nats -- the units of the
-    # loss. It is kept because the multi-hop arms need it: a diffused row is dense
-    # and cannot be carried whole.
-    #
-    # The remaining sizes are DIFFUSION_ROW_CAP / POOL_ROW_CAP in graph_builder,
-    # which are memory guards -- the build reports pool_capped_rows /
-    # diffusion_capped_rows if either binds.
-    truncation_tolerance = 0.0
+    # ---- Ablation switches ---------------------------------------------------
+    row_set = "all"  # anchors / non_anchors: Tables 3-4
+    row_target = "teacher"  # uniform: Table 3 row 7
+    row_columns = "graph"  # random: Table 3 row 8
+    row_reweight = False  # 1/p_j row weights: Table 6
+    batch_local = False  # pool = the batch, L_cal only: Table 3 rows 3-4
+    batch_sampler = "random"  # neighbor: Table 3 rows 2 and 4
 
-    # ---- Per-Epoch Candidate Sampling ---------------------------------------
-    # None is the method: no sampling at all. The candidate set is the anchor's
-    # whole truncated transition row -- every column the teacher put mass on and
-    # nothing else -- so there is no budget, no draw, and no RNG. The set is a
-    # deterministic function of the graph, identical in every epoch.
-    #
-    # This removed the last tuned quantity in the candidate path. It also removed
-    # `support_policy` from the method: at full width, topk / proportional / uniform
-    # return the same set, so that flag now only means something for an ablation arm
-    # given a budget smaller than the row. An int still sets such a budget.
-    #
-    # Row width is the pool width; anchors with shorter rows are padded with their
-    # own index, which `self_mask` removes from every softmax.
-    diffusion_quota = None
-    # The method draws no negatives. Every scored column is a column the teacher
-    # put diffusion mass on, so candidate_size == diffusion_quota and the whole
-    # relational budget is spent on relations the graph actually asserts.
-    #
-    # This removes the two quotas that were never derived from anything -- 40/26
-    # was the best measured pair (75.29 on Qwen3-0.6B -> MiniLMv2-H384, graph v9,
-    # seed 42) but the hard:random split was never shown flat, so they stood as
-    # two tuned constants in a method whose other knobs are all derived.
-    #
-    # Two consequences to hold in view, because they cut in opposite directions:
-    #
-    # * The diffusion group no longer scores a single zero-target column. Its
-    #   softmax now runs over the anchor's own support, where every column
-    #   carries real teacher mass, so the false-zero gradient that motivated the
-    #   ambient scale is gone from the own draw by construction. The audit metric
-    #   `amb_mass_on_zero_diff` should now read ~0; if it does not, the draw is
-    #   not what this comment claims.
-    # * The shared pool loses the ~1,160 uniform-corpus texts per batch that were
-    #   its only columns not drawn from someone's graph neighbourhood, dropping
-    #   from ~4,445 to ~1,400. Scale r=0 still calibrates similarity levels across
-    #   the batch, but over a column set that is now entirely local. That is the
-    #   risk this change carries, and STS Spearman plus the pair-classification
-    #   thresholds are where it would show up first -- they are precisely the
-    #   benchmarks that read absolute cosine levels rather than per-anchor rank.
-    #
-    # A short support draw is padded with the anchor's own index rather than
-    # backfilled with uniform draws; see GGPKDCandidateSampler.sample.
-    hard_neg_k = 0
-    random_neg_k = 0
-    # candidate_size is derived as the sum of the three quotas, so it is now just
-    # diffusion_quota. The ablation arms that need negatives -- `uniform_corpus`
-    # / `no_graph_support` in Tables 2 and 3, which spends the entire budget on
-    # uniform corpus draws -- still set these on the CLI; the machinery stays.
-    # Canonical Top-k support is deterministic; the proportional control redraws
-    # support per epoch.
-
-    # ---- Corpus Columns ------------------------------------------------------
-    # Which column is the graph node, and which defines "same source" for hard
-    # negatives. Both were read by the distiller but declared nowhere, so they
-    # could not be set through this class at all. None keeps the existing
-    # behaviour: the anchor column is picked from task_type.
+    # Which column is the graph node; None picks it from task_type.
     ggpkd_anchor_column = None
-    ggpkd_source_column = "source"
 
-    # ---- Training Setup ------------------------------------------------------
+    # ---- Training setup ------------------------------------------------------
     batch_size = 64
     epochs = 5
-    # 2e-5 undertrains inside the fixed 5-epoch budget: validation avg was still
-    # rising monotonically at epoch 5. At 3e-5 the test avg plateaus from epoch 2
-    # (74.59 -> 75.19 -> ~flat) with stable grad norms, so the budget is actually
-    # spent.
     learning_rate = 3e-5
     min_lr = 3e-6
     num_workers = 4
-    # Per-epoch evaluation is off: it existed to answer whether a run converges
-    # inside the 5-epoch budget, and that question is answered — at lr 3e-5 the
-    # test avg plateaus from epoch 2 (74.59 -> 75.19 -> ~flat). Only the final
-    # evaluation runs now; the per-epoch training means, geometry probe and
-    # step_metrics.jsonl still record convergence without it. Set 1 to re-enable
-    # when a change (new pair, new lr, new objective term) reopens the question.
     eval_every = 0
 
     train_data_path = "data/train_set/merged_3_data_5k_each.csv"
-    # cache_teacher removed: nothing read it. Teacher caching is gated purely by
-    # whether cache_path already exists on disk (distiller.py).
     cache_path = "cache/ggpkd/qwen3_0_6b_to_minilmv2_h384/teacher_train.pt"
     ggpkd_cache_path = "cache/ggpkd/qwen3_0_6b_to_minilmv2_h384/graph.pt"
     ggpkd_log_dir = "logs/ggpkd/qwen3_0_6b_to_minilmv2_h384"
@@ -284,157 +68,67 @@ class GGPKDConfig(BaseConfig):
     normalize_cache = True
     cache_dtype = "float32"
 
-    save_dir = (
-        "models/ggpkd/qwen3_0_6b_to_minilmv2_h384/base_w1_e1_qauto_lr3e-05_seed42"
-    )
-    weights_dir = (
-        "models/ggpkd_weights/qwen3_0_6b_to_minilmv2_h384/"
-        "base_w1_e1_qauto_lr3e-05_seed42"
-    )
+    save_dir = "models/ggpkd/qwen3_0_6b_to_minilmv2_h384/default"
+    weights_dir = "models/ggpkd_weights/qwen3_0_6b_to_minilmv2_h384/default"
     final_weights_only = True
 
-    # ---- Multi-Layer Spec ----------------------------------------------------
-    # Defining both of these switches the distiller to its multi-layer GGPKD
-    # branch. They are off, so that branch never runs, and with it every knob that
-    # only that branch reads.
-    # kd_teacher_layers = [12, 24, 36, 36]
-    # kd_student_layers = [4, 8, 12, 12]
-
-    # ---- Removed: earlier auxiliary objectives -------------------------------
-    # The active objective is L_rel + row_weight * L_row inside the GGPKD
-    # criterion.
-    # lambda_ggpkd,
-    # lambda_cosine, lambda_infonce,
-    # lambda_simcse, simcse_temp, simcse_start_epoch and lambda_sim used to sit
-    # here at 0. Every one of them is read only inside the multi-layer branch
-    # above, so on this path they were unreachable: they printed in the run banner
-    # and counted against the method's knob budget while doing nothing. Their
-    # consumers all read them through getattr with the same defaults these lines
-    # carried, so deleting them changes no behaviour. Re-adding one is only
-    # meaningful together with the kd_*_layers pair.
-
     def validate(self):
-        """Re-checkable invariants.
+        """Re-run by main.py after CLI overrides, so every flag combination is checked."""
+        for name, value, choices in (
+            ("neighbor_source", self.neighbor_source, NEIGHBOR_SOURCES),
+            ("knn_mode", self.knn_mode, KNN_MODES),
+            ("row_set", self.row_set, ROW_SETS),
+            ("row_target", self.row_target, ROW_TARGETS),
+            ("row_columns", self.row_columns, ROW_COLUMNS),
+            ("batch_sampler", self.batch_sampler, BATCH_SAMPLERS),
+        ):
+            if value not in choices:
+                raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+        if int(self.graph_k) < 2:
+            raise ValueError(f"graph_k must be at least 2, got {self.graph_k}")
+        for name in ("cal_weight", "row_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        if self.cal_weight == 0 and self.row_weight == 0:
+            raise ValueError(
+                "at least one of cal_weight and row_weight must be positive"
+            )
+        if not 0.0 <= self.holdout_edge_frac < 1.0:
+            raise ValueError(
+                f"holdout_edge_frac must be in [0, 1), got {self.holdout_edge_frac}"
+            )
 
-        Called from __init__, and again by main.py after the CLI overrides are
-        applied -- those are plain attribute assignments on an already-built
-        config, so without a second call every flag combination goes unchecked.
-        An arm like `--relation_target direct --no_ambient` would then get as far
-        as caching the teacher before the criterion refused it.
-        """
-        if self.truncation_tolerance < 0.0 or self.truncation_tolerance >= 1.0:
-            raise ValueError(
-                "truncation_tolerance is the mass each row may discard; must be in "
-                f"[0, 1), got {self.truncation_tolerance}"
-            )
-        if self.calibration_mode not in CALIBRATION_MODES:
-            raise ValueError(
-                f"calibration_mode must be one of {CALIBRATION_MODES}, "
-                f"got {self.calibration_mode!r}"
-            )
-        if self.row_weight < 0:
-            raise ValueError("row_weight must be non-negative")
-        if not math.isfinite(self.r0_weight) or not math.isfinite(self.r1_weight):
-            raise ValueError("r0_weight and r1_weight must be finite")
-        if self.r0_weight < 0 or self.r1_weight < 0:
-            raise ValueError("r0_weight and r1_weight must be non-negative")
-        r0_active = self.calibration_mode != "none"
-        r1_active = self.relation_target != "ambient_only"
-        active_weight = (
-            (self.r0_weight if r0_active else 0.0)
-            + (self.r1_weight if r1_active else 0.0)
-            + (self.row_weight if not self.batch_local else 0.0)
+        row_switches = (
+            self.row_set != "all"
+            or self.row_target != "teacher"
+            or self.row_columns != "graph"
+            or self.row_reweight
         )
-        if active_weight <= 0:
-            raise ValueError(
-                "the configuration must keep at least one active loss weight positive"
-            )
-        if self.diffusion_quota is not None and self.diffusion_quota < 1:
-            raise ValueError(
-                "diffusion_quota must be None (the whole transition row) or positive"
-            )
-        if self.support_policy not in SUPPORT_POLICIES:
-            raise ValueError(
-                f"support_policy must be one of {SUPPORT_POLICIES}, "
-                f"got {self.support_policy!r}"
-            )
-        self.relation_target = RELATION_TARGET_ALIASES.get(
-            self.relation_target, self.relation_target
-        )
-        if self.relation_target not in RELATION_TARGETS:
-            raise ValueError(
-                f"relation_target must be one of {RELATION_TARGETS}, "
-                f"got {self.relation_target!r}"
-            )
-        if self.knn_mode not in KNN_MODES:
-            raise ValueError(
-                f"knn_mode must be one of {KNN_MODES}, got {self.knn_mode!r}"
-            )
         if self.batch_local:
-            if self.relation_target not in ("ambient_only", "direct"):
+            if self.row_weight > 0 or row_switches:
                 raise ValueError(
-                    "batch_local forms no graph relations, so its target must be "
-                    "read off the teacher bank: relation_target='ambient_only' "
-                    "(one ambient temperature over the batch) or 'direct' (the "
-                    f"anchor's own tau_i); got {self.relation_target!r}"
+                    "batch_local has no graph rows: it needs row_weight=0 and the "
+                    "default row switches"
+                )
+            if self.cal_weight <= 0:
+                raise ValueError(
+                    "batch_local is L_cal over the batch; cal_weight must be > 0"
                 )
             if self.batch_size < 2:
-                raise ValueError(
-                    "batch_local needs at least two texts per batch to have any "
-                    f"relation at all; got batch_size={self.batch_size}"
-                )
-        if self.relation_target == "ambient_only" and self.calibration_mode == "none":
-            # `ambient_only` *is* scale r=0. Removing the scale leaves no term.
-            # `direct` is deliberately not caught here any more: it reads the
-            # teacher bank, which the criterion now receives independently of
-            # whether scale r=0 is in the loss. That combination is the minimal
-            # relational objective the controlled support study is built on.
+                raise ValueError("batch_local needs at least two texts per batch")
+        elif row_switches and self.row_weight <= 0:
             raise ValueError(
-                "relation_target='ambient_only' is the ambient scale itself; it "
-                "cannot be combined with calibration_mode='none'"
+                "the row switches only change L_row; row_weight must be > 0"
             )
-        if self.holdout_edge_frac < 0.0 or self.holdout_edge_frac >= 1.0:
+        if self.row_columns == "random" and self.holdout_edge_frac > 0:
             raise ValueError(
-                "holdout_edge_frac is the fraction of teacher edges withheld from "
-                f"every training support; must be in [0, 1), got {self.holdout_edge_frac}"
+                "row_columns='random' could draw withheld pairs; run it without a holdout"
             )
-        if self.batch_sampler not in BATCH_SAMPLERS:
+        if self.row_reweight and (
+            self.row_set == "anchors" or self.batch_sampler != "random"
+        ):
             raise ValueError(
-                f"batch_sampler must be one of {BATCH_SAMPLERS}, "
-                f"got {self.batch_sampler!r}"
-            )
-        if self.support_policy in ("corpus_uniform", "rewired"):
-            # Off-graph columns carry diffusion mass exactly zero, so under the
-            # method's own target these arms would optimize nothing at all. The
-            # teacher's raw cosine is defined for every pair, which is what makes
-            # a random-support arm a control rather than a deleted objective.
-            if self.relation_target != "direct":
-                raise ValueError(
-                    f"support_policy={self.support_policy!r} draws columns the "
-                    "graph puts no diffusion mass on, so it requires "
-                    "relation_target='direct'; got "
-                    f"{self.relation_target!r}"
-                )
-            if self.diffusion_quota is None:
-                raise ValueError(
-                    f"support_policy={self.support_policy!r} needs an explicit "
-                    "--diffusion_quota: there is no transition row to take the "
-                    "width from, and the arm is only a control when its support "
-                    "size matches the graph-support arm it is compared against"
-                )
-        if self.neighbor_source not in NEIGHBOR_SOURCES:
-            raise ValueError(
-                f"neighbor_source must be one of {NEIGHBOR_SOURCES}, "
-                f"got {self.neighbor_source!r}"
-            )
-        if self.row_centers not in ROW_CENTERS:
-            raise ValueError(
-                f"row_centers must be one of {ROW_CENTERS}, got {self.row_centers!r}"
-            )
-        if self.row_centers == "random" and (self.row_weight <= 0 or self.batch_local):
-            # The switch only reaches L_row; without the term the arm would be a
-            # silent duplicate of the row_weight=0 deletion arm.
-            raise ValueError(
-                "row_centers='random' changes L_row only, so it needs row_weight > 0 "
-                "and a graph (not batch_local)"
+                "row_reweight corrects the inclusion probability of uniform anchors; it "
+                "needs row_set != 'anchors' and batch_sampler='random'"
             )

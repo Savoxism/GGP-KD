@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Every run tree under one experiment root, flattened into one tidy CSV.
 
-One row per (arm, seed). Four families of column, and each is there because an
+One row per (arm, seed). Five families of column, and each is there because an
 analysis that lacks it can reach a wrong conclusion:
 
     results      the nine benchmarks plus Avg-In / Avg-Out / Avg-All, in points.
@@ -9,21 +9,24 @@ analysis that lacks it can reach a wrong conclusion:
                  rather than from the label in the runner. A mislabelled arm is
                  the failure mode that survives every other check.
     cost         wall seconds and peak memory, plus the encoder counters the
-                 GGPKD step records. Support arms are matched on support *size*,
-                 not on compute -- a corpus-uniform draw deduplicates far worse
-                 than a teacher draw and so encodes more texts per step -- so the
-                 comparison is only honest if that difference is on the table.
+                 distiller records. The arms of Table 3 are matched on steps, not
+                 on compute -- a subgraph step encodes ~70x the texts of an
+                 in-batch step -- so the comparison is only honest if that
+                 difference is on the table (Table 2).
     diagnostics  the final epoch's losses and geometry probe, so a suspicious
                  downstream number can be traced to a degenerate objective
                  without re-running anything.
+    graph        reciprocal connectivity and target sharpness of the graph the
+                 run trained against, read from its manifest (Table 5).
 
 Failed and unfinished runs become rows with `status` set and blank metrics, so a
 partially completed sweep still exports and the gaps are visible. Nothing here
 aborts on one bad run.
 
 Usage:
-    python scripts/exp/export_runs.py results/exp2/<run_id> \
-        --experiment exp2_support --out runs/exp2/results.csv
+    python scripts/exp/export_runs.py results/table3_exposure/<run_id> \
+        --experiment table3_exposure --pair qwen3_0_6b_to_minilmv2_h384 \
+        --out runs/table3_exposure/results.csv --merge
 """
 
 from __future__ import annotations
@@ -51,21 +54,21 @@ from scripts.ggpkd.run_metrics import (
 # makes the two that differ hard to find.
 CONFIG_FIELDS = (
     "distill_method",
-    "support_policy",
-    "relation_target",
-    "use_ambient",
-    "r0_weight",
-    "r1_weight",
-    "row_weight",
-    "batch_sampler",
-    "batch_size",
-    "diffusion_quota",
     "graph_k",
-    "knn_mode",
     "neighbor_source",
-    "row_centers",
+    "knn_mode",
+    "fixed_bandwidth",
     "holdout_edge_frac",
     "holdout_seed",
+    "cal_weight",
+    "row_weight",
+    "row_set",
+    "row_target",
+    "row_columns",
+    "row_reweight",
+    "batch_local",
+    "batch_sampler",
+    "batch_size",
     "epochs",
     "learning_rate",
     "seed",
@@ -77,20 +80,41 @@ CONFIG_FIELDS = (
 # Training diagnostics from the last epoch record.
 TRAIN_FIELDS = (
     "loss",
-    "loss_rel",
-    "loss_amb",
-    "loss_nbr",
-    "loss_r0_weighted",
-    "loss_r1_weighted",
-    "r0_weight_effective",
-    "r1_weight_effective",
+    "loss_total",
+    "loss_cal",
     "loss_row",
+    "loss_cal_weighted",
+    "loss_row_weighted",
+    "row_share",
+    "pool_size",
+    "cal_columns",
+    "cal_teacher_entropy",
+    "cal_student_entropy",
+    "row_count",
+    "row_eff_denom",
     "row_exposed_mass",
+    "row_exposed_mass_p10",
+    "row_exposed_mass_p90",
+    "row_teacher_entropy",
+    "row_kl_p50",
+    "row_kl_p90",
+    "row_ess_ratio",
     "grad_norm",
     "encoded_texts_cum",
     "encoded_tokens_cum",
-    "candidates_per_anchor",
     "mean_step_seconds",
+    "peak_memory_mb",
+)
+
+# Build statistics of the graph a run trained against, from `run.json`. Table 5
+# reads Avg against reciprocal connectivity, and a flat target (low KL to uniform)
+# is the failure a large k produces, so both belong beside the scores.
+GRAPH_FIELDS = (
+    "reciprocal_components",
+    "reciprocal_isolated",
+    "reciprocal_largest_frac",
+    "reciprocity",
+    "target_kl_uniform",
 )
 
 # Geometry probe from the last epoch record.
@@ -128,9 +152,9 @@ def _flatten(prefix: str, source: dict | None, fields) -> dict[str, object]:
             continue
         value = source[name]
         # bool before int: `bool` is a subclass of `int`, so the numeric branch
-        # would render use_ambient=False as 0.0 and an analysis grouping on it
-        # would read a float column where it expected a flag. int before float
-        # for the same reason in reverse: a quota of 15 must not become "15.0".
+        # would render batch_local=False as 0 and an analysis grouping on it
+        # would read a number where it expected a flag. int before float for the
+        # same reason in reverse: graph_k=100 must not become "100.0".
         if isinstance(value, bool):
             values[f"{prefix}{name}"] = str(value)
         elif isinstance(value, int):
@@ -169,10 +193,13 @@ def collect(run_dir: Path) -> dict[str, object]:
     manifest = run_dir / "run.json"
     config = {}
     artifact_meta = {}
+    graph_stats = {}
     if manifest.is_file():
         blob = json.loads(manifest.read_text(encoding="utf-8"))
         config = blob.get("config", {}) or {}
-        artifact_meta = (blob.get("artifact") or {}).get("metadata", {}) or {}
+        artifact = blob.get("artifact") or {}
+        artifact_meta = artifact.get("metadata", {}) or {}
+        graph_stats = artifact.get("graph_stats", {}) or {}
         row["run_id"] = blob.get("run_id", "")
         # run.json records the commit as `sha`; reading `commit` left the column
         # empty for every run.
@@ -187,7 +214,12 @@ def collect(run_dir: Path) -> dict[str, object]:
         **config,
         **{k: v for k, v in artifact_meta.items() if k in CONFIG_FIELDS},
     }
+    # The artifact records the bandwidth rule by name, not as the config's flag.
+    if "bandwidth" in artifact_meta:
+        merged_config["fixed_bandwidth"] = artifact_meta["bandwidth"] == "median"
     row.update(_flatten("cfg_", merged_config, CONFIG_FIELDS))
+    # Pointwise runs build no graph, so these stay blank for them.
+    row.update(_flatten("graph_", graph_stats, GRAPH_FIELDS))
 
     stats_path = run_dir / "run_stats.json"
     if stats_path.is_file():
@@ -276,8 +308,8 @@ def main() -> int:
         "--merge",
         action="store_true",
         help="keep rows already in --out whose (experiment, pair, arm, seed) this "
-        "export does not produce, instead of overwriting the file. A stage that "
-        "runs several pairs, or re-runs one arm, then adds to one table",
+        "export does not produce, instead of overwriting the file. A table that "
+        "runs several pairs, or re-runs one arm, then adds to one CSV",
     )
     args = parser.parse_args()
 

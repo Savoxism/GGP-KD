@@ -1,211 +1,142 @@
 # Experiments
 
-Two generations live here.
+One script per table of `story.md` §5. Every training arm runs through the same
+runner (`lib/run_arms.sh`) and `scripts/ggpkd/train.sh`, so two arms that differ
+in one flag differ in nothing else.
 
-The current staged protocol uses student-kNN by default and keeps the complete
-GGPKD objective active in every comparison arm. Only explicit loss-decomposition
-arms in Stages 1/2D remove or zero a term; Stage 3G keeps all three coefficients
-strictly positive. The minimal objective described under E1--E4 below is historical
-and must not be used as evidence for the current paper.
+## Order
 
-## The staged sweeps (current — `experiments.md`)
-
-One script per stage, run in order. The orchestrator stops after Stage 0 on
-purpose: Stage 0 chooses the operating point, choosing it is a judgement call,
-and no script may guess it.
+Table 5 chooses the operating point `k` and every other table runs at it, so it
+goes first. The orchestrator stops after Table 5 on purpose: choosing `k` is a
+judgement call and no script may guess it.
 
 ```bash
-GPUS=0,1,2,3            bash scripts/exp/run_all.sh   # Stage 0, then stop
-column -s, -t runs/stage0_graph_k/results.csv | less -S
-GRAPH_K=<winner> GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Stages 1-3G
-DRY_RUN=1 GRAPH_K=50    bash scripts/exp/run_all.sh   # print the plan only
+GPUS=0,1,2,3              bash scripts/exp/run_all.sh   # Table 5, then stop
+column -s, -t runs/table5_graph_k/results.csv | less -S
+GRAPH_K=<k> GPUS=0,1,2,3  bash scripts/exp/run_all.sh   # Tables 3, 4, 4h, 6, 1, 2
+DRY_RUN=1 GRAPH_K=100     bash scripts/exp/run_all.sh   # print the plan only
 ```
 
-| stage | script | question | runs |
+`FROM` / `TO` restrict the range (`5`, `3`, `4`, `4h`, `6`, `1`, `2`). On the
+second pass Table 5 is skipped when its CSV already holds `graph_k_<GRAPH_K>`,
+and otherwise run at that one `k`, because that run is Table 6's default row and
+Table 1's pair (c).
+
+| table | script | arms | runs / seed |
 |---|---|---|---|
-| 0 | `stage0_graph_k.sh` | what operating point? also the full-model reference | 12 |
-| 1 | `stage1_deletions.sh` | does each component earn its place? | 15 |
-| 2B | `stage2b_ladder.sh` | which texts should an anchor be compared against? | 12/pair |
-| 2C | `stage2c_dose_response.sh` | does the score follow the count when batch composition supplies it? | 15 |
-| 2D | `stage2d_components.sh` | ablation on the shipped objective | 12 |
-| 3 | `stage3_main_table.sh` | main-table deliverable | 6 |
-| 3G | `stage3g_lambda_sensitivity.sh` | independent $\lambda_0$, $\lambda_1$, $\lambda_{row}$ sensitivity | 18 |
+| 5 | `table5_graph_k.sh` | `graph_k_25`, `graph_k_50`, `graph_k_100`, `graph_k_200` | 4 |
+| 3 | `table3_exposure.sh` | `pointwise_random`, `pointwise_neighbor`, `in_batch_random`, `in_batch_neighbor`, `anchor_rows`, `ours`, `uniform_target`, `random_columns` | 8 |
+| 4 | `table4_loss_terms.sh` | `ours`, `cal_off`, `row_off`, `anchors_only`, `anchors_excluded` | 5 |
+| 4 (held-out) | `table4_heldout.sh` | post-hoc on Table 4's checkpoints | 0 |
+| 6 | `table6_robustness.sh` | `cal_0p25`, `cal_1p0`, `row_reweight`, `student_knn`, `mutual_knn`, `global_tau` | 6 |
+| 1 | `table1_main.sh` | `ours` on each of `PAIRS` | 1 per pair |
+| 2 | `table2_cost.sh` | `pointwise`, `in_batch`, `ours` | 3 |
 
-Two stages need no GPU: **A** is the formula $(B-1)k/(N-1)$ plus one exposure
-curve from `coverage.py`, and **E** scores Stage 2D's checkpoints post-hoc with
-`exp3_heldout_geometry.sh`.
+What each arm changes, relative to the method with no flags:
 
-`FROM` / `TO` restrict the range (`0`, `1`, `2b`, `2c`, `2d`, `3`, `3g`). Everything
-else — `GPUS`, `SEEDS`, `PAIR`/`PAIRS`, `CORPUS`, `CACHE_ROOT`, `DRY_RUN` — is
-forwarded to the stage scripts.
+* **Table 5** — `--graph_k k`, one graph per `k`. Rule: the smallest `k` at which
+  Avg saturates and the reciprocal graph is about connected
+  (`graph_reciprocal_components`, `graph_reciprocal_isolated`).
+* **Table 3** — `--method pointwise` (± `--batch_sampler neighbor`);
+  `--batch_local` (± `--batch_sampler neighbor`); `--row_set anchors`;
+  `--row_target uniform`; `--row_columns random`. After training it runs
+  `coverage.py` on the graph and writes `runs/table3_exposure/coverage_<pair>.csv`:
+  the measured in-batch neighbours per row under random and neighbour batching,
+  beside the analytic `(B-1)k/(N-1)`.
+* **Table 4** — every arm trains on graph `main_holdout`
+  (`--holdout_edge_frac 0.2 --holdout_seed 12345`, env `HOLDOUT_FRAC` /
+  `HOLDOUT_SEED`): `--cal_weight 0`, `--row_weight 0`, `--row_set anchors`,
+  `--row_set non_anchors`. Its `ours` arm is the reference, not Table 5's.
+* **Table 4 held-out** — `heldout_geometry.py` over the latest Table 4 run tree
+  (or `RUN_ROOT`) against `graph_main_holdout.pt`. The two columns are `spearman`
+  on `heldout_same_component` and `heldout_cross_component`: held-out edges split
+  by whether both endpoints share a component of the reciprocal graph built on
+  the training edges. Writes `runs/table4_heldout/heldout_geometry.csv`.
+* **Table 6** — `--cal_weight 0.25`, `--cal_weight 1.0`, `--row_reweight`, and
+  three graph variants with their own keys: `student` (`--neighbor_source
+  student`), `mutual` (`--knn_mode mutual`), `median_tau` (`--fixed_bandwidth`).
+  The default row is Table 5's `graph_k_<GRAPH_K>`; the script warns if it is
+  missing.
+* **Table 1** — `PAIRS` defaults to `bge_m3_to_minilmv2_h768,qwen3_4b_to_bert_base`;
+  `qwen3_0_6b_to_minilmv2_h384` comes from Table 5. Every pair exports into the
+  same `runs/table1_main/results.csv` with merge, and each pair gets its own
+  result tree `results/table1_main/<pair>/<run_id>`.
+* **Table 2** — `JOBS_PER_GPU` is forced to 1 so step time and peak memory are
+  read on unshared GPUs.
 
-Run only the three-lambda sensitivity matrix with:
+## Environment
 
-```bash
-GRAPH_K=<winner> GPUS=0,1,2,3 SEEDS=42,43,44 \
-  bash scripts/exp/stage3g_lambda_sensitivity.sh
-```
+| variable | default | meaning |
+|---|---|---|
+| `GRAPH_K` | required (not Table 5) | operating point from Table 5 |
+| `GPUS` | every GPU `nvidia-smi` lists | comma-separated device ids |
+| `SEEDS` | `42` | `42,43,44` for paper numbers |
+| `PAIR` | `qwen3_0_6b_to_minilmv2_h384` | teacher->student pair (Tables 2-6) |
+| `PAIRS` | see Table 1 | pairs for Table 1 |
+| `GRAPH_KS` | `25,50,100,200` | Table 5 sweep |
+| `CORPUS` | `data/train_set/merged_3_data_5k_each.csv` | training CSV |
+| `CACHE_ROOT` | `cache/exp` | teacher caches and graphs, `<pair>/<corpus>/graph_<key>.pt` |
+| `JOBS_PER_GPU` | `1` | concurrent runs per GPU (ignored by Table 2) |
+| `ARMS` | all | comma-separated subset of a table's arms |
+| `RUN_ID`, `RESULT_BASE`, `CSV_OUT` | timestamp, `results/<table>`, `runs/<table>/results.csv` | output locations |
+| `DRY_RUN` | `0` | `1` prints the matrix and runs nothing |
 
-Its default six arms halve and double one coefficient at a time around
-`(r0_weight, r1_weight, row_weight) = (0.5, 0.5, 1.0)`. Override the tested
-points with `LAMBDA0_VALUES`, `LAMBDA1_VALUES`, and `LAMBDA_ROW_VALUES`; values
-must stay strictly positive so the study remains full-loss.
+Graph-defining flags (`--graph_k --neighbor_source --knn_mode --fixed_bandwidth
+--holdout_edge_frac --holdout_seed`) belong in a table's `GRAPH_SPEC`, never in
+an arm's flags: they change the cached artifact, and the runner builds each graph
+once, serially, before any arm starts.
 
-### Re-running part of a stage
+## Re-running one arm
 
-`ARMS=a,b` runs only those arms of a stage and builds only the graphs they use.
-Export merges by `(experiment, pair, arm, seed)`, so the new rows replace the old
-ones in the same `results.csv` instead of overwriting the file. The pieces the
-2026-09-12 sweep got wrong, on `qwen3_0_6b_to_minilmv2_h384`:
-
-```bash
-export GRAPH_K=200 GPUS=0,1,2,3,4,5,6,7 JOBS_PER_GPU=2
-ARMS=row_centers_random,uniform_target bash scripts/exp/stage1_deletions.sh
-ARMS=student_knn                       bash scripts/exp/stage2b_ladder.sh
-ARMS=full                              bash scripts/exp/stage2d_components.sh
-bash scripts/exp/exp3_heldout_geometry.sh   # needs Stage 2D's full run tree
-```
-
-Stage 2D's graph keys are now `*_holdout`, so its old run tree scores against
-`graph_main_holdout.pt` too (`RUN_ROOT=<old 2D root>`).
-
----
-
-## The original motivation study (E1–E4)
-
-Superseded by the stages above, and kept because `exp3_heldout_geometry.sh` is
-still the held-out probe and `coverage.py` is still the exposure measurement.
-Their numbers were all measured before the mutual filter, row truncation,
-multi-hop diffusion and fixed-reference calibration were removed, so they
-describe a different method — read them for relative structure only.
-
-One `.sh` per experiment, three seeds each, every result exported to CSV under
-`runs/<experiment>/`. The four answer four different questions, in order:
-
-| | Question | Script | Runs | Output |
-|---|---|---|---|---|
-| E1 | Is batching deciding the learning signal? | `exp1_batch_intervention.sh` | 27 | `runs/exp1_batch/{results,coverage}.csv` |
-| E2 | Does teacher relevance matter, or just leaving the batch? | `exp2_support_intervention.sh` | 15/pair | `runs/exp2_support/results.csv` |
-| E3 | Does it generalize past the supervised edges? | `exp3_heldout_geometry.sh` | 0 (post-hoc) | `runs/exp3_heldout/heldout_geometry.csv` |
-| E4 | Does it scale the way the hypothesis predicts? | `exp4_exposure_scaling.sh` | 84 | `runs/exp4_scaling/{results,exposure}.csv` |
-
-Run order matters: **E1 is the gate**. If an in-batch relational objective does
-not move with batch composition by more than the pointwise arm's seed noise, the
-motivation is not real and E2–E4 are not worth their compute.
+`ARMS=a,b` runs only those arms of a table and builds only the graphs they use.
+The export merges by `(experiment, pair, arm, seed)`, so the new rows replace the
+old ones in the same `results.csv` and every other row is kept.
 
 ```bash
-DRY_RUN=1 bash scripts/exp/exp1_batch_intervention.sh   # print the matrix, run nothing
-GPUS=0,1,2,3 bash scripts/exp/exp1_batch_intervention.sh
-bash scripts/exp/exp2_support_intervention.sh
-bash scripts/exp/exp3_heldout_geometry.sh               # scores E2's checkpoints
-bash scripts/exp/exp4_exposure_scaling.sh
+GRAPH_K=100 GPUS=0 ARMS=uniform_target bash scripts/exp/table3_exposure.sh
+GRAPH_K=100 GPUS=0 ARMS=student_knn    bash scripts/exp/table6_robustness.sh
+GRAPH_K=100 GPUS=0 SEEDS=43 ARMS=cal_off bash scripts/exp/table4_loss_terms.sh
+bash scripts/exp/table4_heldout.sh     # rescore after any Table 4 re-run
 ```
 
-Common environment variables: `GPUS` (default: every GPU `nvidia-smi` reports),
-`SEEDS` (default `42,43,44`), `PAIR`, `DRY_RUN=1`, `CACHE_ROOT`, `RESULT_BASE`.
-Each script's header documents its own.
+## Exporting
 
-## The shared harness
+`run_arms` exports automatically when every run in a sweep succeeds, and writes
+the run root to `runs/<table>/last_run_root.txt`. To export a tree by hand — a
+sweep with a failed run, or one synced back from a cluster:
 
-Every relational arm in the superseded E1, E2 and E4 study trains the **same
-historical minimal objective**:
-
+```bash
+.venv/bin/python scripts/exp/export_runs.py results/table3_exposure/<run_id> \
+    --experiment table3_exposure --pair qwen3_0_6b_to_minilmv2_h384 \
+    --out runs/table3_exposure/results.csv --merge
 ```
-L = (1/|B|) sum_i KL( p_T(. | S_i) || p_S(. | S_i) )
-```
 
-one KL per anchor, over that anchor's own columns `S_i`, at that anchor's own
-bandwidth `tau_i`. In flags: `--relation_target direct --no_ambient
---row_weight 0`. Only `S_i` changes between arms.
+One row per (arm, seed):
 
-Two things about this are worth knowing before reading any result.
+* `score_*` — nine benchmarks plus Avg In / Avg Out / Avg All, in points.
+* `cfg_*` — read from each run's own `run.json`, with the graph fields taken from
+  the artifact the run trained on, so a mislabelled arm is visible.
+* `train_*` — final-epoch means of the criterion's metrics (`loss_cal`,
+  `loss_row`, `pool_size`, `row_count`, `row_exposed_mass`, ...) and the
+  distiller's cost counters (`encoded_texts_cum`, `mean_step_seconds`,
+  `peak_memory_mb`).
+* `graph_*` — reciprocal connectivity and target sharpness of that artifact.
+  Blank for pointwise runs, which build no graph.
+* `cost_*` — wall clock and peak host/GPU memory measured outside the process.
+* `geom_*` — the final-epoch geometry probe.
+* `status` — `ok`, or why the row is incomplete. A partial sweep still exports.
 
-**Candidate sharing does not contaminate it.** The graph-scale softmax is masked
-to each anchor's own draw (`diffusion_mask = self_mask | ~own_mask`,
-`src/criterions/ggpkd_distillation.py:962`), so deduplicating the batch's
-candidates across anchors changes the encoder cost and cannot change the loss.
-The study gets an isolated per-anchor objective *and* the ~3x cheaper encode.
+## Things to check before trusting a number
 
-**The in-batch arm is temperature-matched.** `--batch_local --relation_target
-direct` scores the batch columns at `tau_i`, the same temperature the
-teacher-support arms use. The older `ambient_only` form of that baseline scores
-at one global temperature, which would have made the arms differ in two things at
-once.
-
-Full GGPKD (`lambda0_bar L_{r=0} + lambda1_bar L_{r=1} + lambda L_row`) is deliberately **not** used
-here. If the study's arms carried the ambient scale and the auxiliary rows, no
-reader could tell whether a gain came from support selection or from those.
-
-## What each CSV carries
-
-`export_runs.py` writes one row per (arm, seed):
-
-* `score_*` — nine benchmarks plus Avg-In / Avg-Out / Avg-All, in points.
-* `cfg_*` — read from each run's own `run.json`, not from the arm label, so a
-  mislabelled arm is visible.
-* `cost_*`, `train_encoded_texts_cum` — arms are matched on **support size**, not
-  on compute; a corpus-uniform draw deduplicates far worse than a teacher draw
-  and encodes more texts per step. That difference belongs in the table.
-* `train_*`, `geom_*` — final-epoch losses and the geometry probe, so a strange
-  downstream number can be traced without re-running.
-* `status` — `ok`, or why the row is incomplete. A partially finished sweep still
-  exports.
-
-Join keys across files: `(pair, arm, seed)` for E2/E3, `(n_items, batch_size)`
-for E4's exposure file.
-
-## Things to check in the output before trusting it
-
-**`train_candidates_per_anchor` vs the requested budget.** The teacher arms are
-given `SUPPORT_SIZE` (default `batch_size - 1` = 63) columns, but the real
-transition rows average 66.8 with a minimum of 1, so anchors with shorter rows
-get less. If this column sits well below 63, the teacher arms are carrying *less*
-supervision than the in-batch arm, which biases the comparison against the
-paper's claim — conservative, but it must be reported. Lower `SUPPORT_SIZE` if
-the gap is large.
-
-**`holdout_starved_rows` in the graph build log.** A row whose every edge landed
-in the held-out 20% keeps its nearest neighbour anyway, so the "never supervised"
-claim is false for that one edge. Expected to be 0 at the production corpus
-(degree ~67); it was 1 of 300 on a smoke corpus with degree 8.
-
-**`pairs_per_anchor` vs `--knn-k` in E3.** The recall column needs each anchor to
-have comfortably more positives than `k`, or most anchors are dropped and the
-survivors score near 1 regardless of arm. At the production corpus (degree ~67,
-20% withheld) that is ~13 held-out edges per anchor, so the default `knn-k 10`
-is at the edge; the script warns when the ratio is below 2x. Read `spearman` and
-`pair_order` alongside it — neither depends on the set's width.
-
-**The E4 y-axis must be relative.** A larger corpus makes everything better and
-also raises TRE, so plotting an absolute score against TRE shows a collapse
-driven by N alone. Plot each relational arm's gap to the pointwise arm at the
-same N; that is why a pointwise run exists at every corpus size.
-
-**E1's `pointwise_*` arms are a measurement floor, not a competitor.** Their
-objective cannot read batch membership, so their spread across the three samplers
-*is* the noise level the other arms are read against.
-
-## The one arm that is not one-factor
-
-`student_knn` (E2, opt-in via `WITH_STUDENT_KNN=1`) builds its graph from the
-base student's embeddings, so the row bandwidths `tau_i` are the student's rather
-than the teacher's. It differs from the teacher arms in temperature as well as in
-support. Report it as indicative, and say so.
-
-## Known scope limits
-
-* **E4's corpus sizes cap at ~48.7k** — the deduplicated union of the three
-  training CSVs. `make_subsets.py` refuses a larger N rather than truncating
-  silently. N spans one decade; N/B spans from ~20 to ~3000, which is the axis
-  the hypothesis names. Reaching 500k needs an external corpus and roughly 2
-  GPU-hours per training run at that size.
-* **E3 evaluates held-out *edges*, not held-out *texts*.** Both relation sets are
-  computed from the cached teacher, so it runs post-hoc on any checkpoint with no
-  teacher forward pass. A text-level held-out set (`data/val_set/`) would be a
-  stronger generalization claim and needs a teacher pass to build.
-* **E2's default family withholds 20% of teacher edges** (`HOLDOUT_FRAC=0.2`) so
-  that E3 can score the same checkpoints. Its absolute numbers therefore do not
-  line up with the paper's main table — it is a controlled study, and the
-  comparison that matters is between its own arms. `HOLDOUT_FRAC=0` gives a
-  family comparable to the main table, at the cost of E3's masked-neighbour
-  metric.
+* **`graph_target_kl_uniform`.** Near zero means the rows went flat: too large a
+  `k` measures the distance out of the neighbourhood, not the local decay.
+* **`holdout_starved_rows` in Table 4's graph build log.** A row whose every edge
+  was withheld keeps its nearest neighbour; `heldout_geometry.py` drops that pair
+  from the held-out sets.
+* **`n_pairs` for `heldout_cross_component`.** At `k=100` the reciprocal graph has
+  few components, so cross-component held-out pairs are rare. Under 100 pairs the
+  metrics are left blank rather than reported on noise; `knn_recall` also needs
+  more than `--knn-k` positives per anchor, so read `spearman` and `pair_order`
+  there.
+* **Pointwise arms do not deduplicate the corpus**; GGPKD does. They use separate
+  teacher caches (`teacher_pointwise.pt` vs `teacher_train.pt`) for that reason.

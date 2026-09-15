@@ -15,7 +15,7 @@ source "$REPO_ROOT/scripts/common/run_stats.sh"
 # cache hit, by which point the file is already wrong.
 PAIR_KEY="${PAIR_KEY:-qwen3_0_6b_to_minilmv2_h384}"
 
-# Set by scripts/ggpkd/run_paper.sh, which pins one run per GPU and needs the
+# Set by scripts/exp/lib/run_arms.sh, which pins one run per GPU and needs the
 # project interpreter rather than whatever `python3` resolves to on the server.
 # All three keep the previous behaviour when unset.
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -81,7 +81,7 @@ WEIGHTS_DIR="${WEIGHTS_DIR:-}"
 # and what it cost stay together even when SAVE_DIR is a per-seed directory.
 STATS_FILE="${STATS_FILE:-$SAVE_DIR/run_stats.json}"
 
-# The method is an env var so the motivation-study runners can reuse this
+# The method is an env var so the table runners can reuse this
 # script -- and with it the pair table, the cache paths and the run-stats wrapper
 # -- for the pointwise measurement floor. Everything else about a run is
 # unchanged, which is the point: two arms that differ only in `--method` must not

@@ -1,4 +1,11 @@
-from .candidate_sampler import GGPKDCandidateSampler
-from .graph_builder import build_or_load_ggpkd_artifact
+from .graph_builder import (
+    build_or_load_ggpkd_artifact,
+    pool_inclusion_probability,
+    reciprocal_component_labels,
+)
 
-__all__ = ["build_or_load_ggpkd_artifact", "GGPKDCandidateSampler"]
+__all__ = [
+    "build_or_load_ggpkd_artifact",
+    "pool_inclusion_probability",
+    "reciprocal_component_labels",
+]

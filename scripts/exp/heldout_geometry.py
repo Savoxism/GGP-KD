@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """Held-out teacher geometry, measured post-hoc on saved student weights.
 
-The middle link of the paper's chain. A downstream score says a student is better;
-a training loss says it fitted what it was shown. Neither answers the question the
-support study actually raises -- whether teacher-selected exposure improves the
-teacher relations the student was *never* supervised on, or only the ones it was.
+The held-out columns of Table 4 (story.md §5, C3). A downstream score says a
+student is better; a training loss says it fitted what it was shown. Neither says
+whether the student recovered teacher relations it was *never* supervised on, and
+§3's argument makes a sharper prediction than "it generalizes": L_row pins the
+teacher's geometry up to one additive offset per connected component of the
+reciprocal kNN graph, and L_cal is what ties the components together. So
+held-out pairs inside one component should be recovered with or without L_cal,
+and pairs across components only with it.
 
-Three relation sets, none of which any arm was trained on. They are computed from
-the cached teacher and the graph artifact, so no teacher forward pass is needed and
-this runs on any checkpoint after the fact:
+The relation sets below are computed from the cached teacher and the graph
+artifact, so no teacher forward pass is needed and this runs on any checkpoint
+after the fact. None contains a pair any arm was trained on as a row entry:
 
     heldout_edges  the edges withheld from the graph by `--holdout_edge_frac`.
                    Reconstructed with the same symmetric hash the build used, so
                    the split cannot drift between training and evaluation. Only
-                   present for a run trained with a holdout; the runner prints a
-                   warning and skips the set otherwise.
+                   present for a run trained with a holdout.
+    heldout_same_component, heldout_cross_component
+                   heldout_edges split by whether both endpoints lie in the same
+                   component of the reciprocal graph built on the artifact's
+                   (training) rows. The split is the Table 4 prediction.
     nonlocal       teacher ranks graph_k+1 .. `--nonlocal-mult` * graph_k. These
                    are teacher-relevant but outside every arm's retrieval width,
                    so this set exists even for a family trained without a holdout
                    -- it is the "did the student learn structure beyond its own
                    neighbourhood" question.
-    unsupervised   every pair except the anchor's own graph row. The broadest of
-                   the three, and the loosest: most of it is pairs the teacher
+    unsupervised   every pair except the anchor's own graph row and in-edges.
+                   The broadest set, and the loosest: most of it is pairs the teacher
                    considers unrelated, so it moves with anisotropy. Reported for
                    completeness, not as the headline.
 
@@ -46,11 +53,11 @@ sampled anchor's row is exact rather than restricted to a probe subset.
 
 Usage:
     python scripts/exp/heldout_geometry.py \
-        --runs results/exp2/<run_id>/runs \
-        --cache cache/ggpkd/<pair>/teacher_train.pt \
-        --artifact cache/ggpkd/<pair>/graph_holdout.pt \
+        --runs results/table4_loss_terms/<run_id>/runs \
+        --cache cache/exp/<pair>/<corpus>/teacher_train.pt \
+        --artifact cache/exp/<pair>/<corpus>/graph_main_holdout.pt \
         --train-data data/train_set/merged_3_data_5k_each.csv \
-        --out runs/exp3/heldout_geometry.csv
+        --out runs/table4_heldout/heldout_geometry.csv
 """
 
 from __future__ import annotations
@@ -70,9 +77,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.exp.coverage import load_teacher
 from src.distill.geometry import _spearman, pair_order_accuracy
-from src.ggpkd.graph_builder import heldout_edge_mask
+from src.ggpkd.graph_builder import heldout_edge_mask, reciprocal_component_labels
 
-RELATION_SETS = ("heldout_edges", "nonlocal", "unsupervised")
+RELATION_SETS = (
+    "heldout_edges",
+    "heldout_same_component",
+    "heldout_cross_component",
+    "nonlocal",
+    "unsupervised",
+)
 
 
 def resolve_anchor_column(frame: pd.DataFrame) -> str:
@@ -85,7 +98,7 @@ def resolve_anchor_column(frame: pd.DataFrame) -> str:
 def corpus_texts(train_data: Path) -> list[str]:
     """The deduplicated anchor corpus, in the order the graph was built on.
 
-    Must match `src.methods.ggpkd._dedup_frame` exactly: the teacher cache and the
+    Must match `src.methods.ggpkd.prepare_frame` exactly: the teacher cache and the
     artifact are indexed by these row positions, so a different dedup rule here
     would silently pair every anchor with another anchor's teacher vector.
     """
@@ -168,22 +181,31 @@ def build_masks(
 ) -> dict[str, torch.Tensor]:
     """One boolean [P, N] mask per relation set. True means "score this pair".
 
-    The supervised set that all three exclude is the union of the anchor's graph
-    row and its diffusion pool -- the columns some arm could have been trained on.
-    Excluding only the transition row would leave the multi-hop pool columns in,
-    and those *are* supervised for the diffusion arms.
+    The supervised set every mask excludes is the anchor's own graph row *and* its
+    in-edges -- the texts u with anchor in N(u). L_row supervises every encoded
+    row, so a pair (anchor, u) is a training target from u's side whenever the
+    anchor is in u's row, even though u is not in the anchor's.
     """
     n_items = int(teacher_norm.size(0))
-    pool = artifact["pool_indices"].numpy()
     transition = artifact["transition_neighbors"].numpy()
+    labels, _ = reciprocal_component_labels(transition)
 
     supervised = torch.zeros(len(anchors), n_items, dtype=torch.bool)
+    position_of = np.full(n_items, -1, dtype=np.int64)
+    position_of[np.asarray(anchors, dtype=np.int64)] = np.arange(len(anchors))
     for position, anchor in enumerate(anchors):
         anchor = int(anchor)
-        columns = np.concatenate([pool[anchor], transition[anchor]])
+        columns = transition[anchor]
         columns = columns[columns >= 0]
         supervised[position, torch.from_numpy(columns).long()] = True
         supervised[position, anchor] = True
+    sources, slots = np.nonzero(transition >= 0)
+    targets = transition[sources, slots].astype(np.int64)
+    hit = position_of[targets] >= 0
+    supervised[
+        torch.from_numpy(position_of[targets[hit]]),
+        torch.from_numpy(sources[hit].astype(np.int64)),
+    ] = True
 
     masks: dict[str, torch.Tensor] = {}
     masks["unsupervised"] = ~supervised
@@ -202,8 +224,8 @@ def build_masks(
     if rank_width > graph_k:
         band = ranked[:, graph_k:rank_width]
         nonlocal_mask.scatter_(1, band, True)
-    # A pair in the band that some arm nonetheless had in its pool is dropped: the
-    # band is defined by rank, and the pool is ragged, so the two can overlap.
+    # A pair in the band that is nonetheless a graph edge is dropped: the band is
+    # defined by the anchor's rank, and an in-edge can sit at any rank.
     masks["nonlocal"] = nonlocal_mask & ~supervised
 
     if holdout_frac > 0:
@@ -218,7 +240,18 @@ def build_masks(
         held = torch.from_numpy(withheld & within)
         holdout_mask = torch.zeros(len(anchors), n_items, dtype=torch.bool)
         holdout_mask.scatter_(1, ranked, held)
+        # A row whose every edge was withheld keeps its nearest neighbour
+        # (holdout_starved_rows), so that one pair was trained on after all.
+        holdout_mask &= ~supervised
         masks["heldout_edges"] = holdout_mask
+        # Components of the *training* graph: the artifact's rows already lack
+        # the withheld edges, which is the graph L_row actually saw.
+        label_tensor = torch.from_numpy(labels)
+        same = label_tensor[torch.from_numpy(np.asarray(anchors, dtype=np.int64))][
+            :, None
+        ] == label_tensor[None, :]
+        masks["heldout_same_component"] = holdout_mask & same
+        masks["heldout_cross_component"] = holdout_mask & ~same
     return masks
 
 
@@ -369,7 +402,7 @@ def main() -> int:
 
     artifact = torch.load(args.artifact, map_location="cpu", weights_only=False)
     metadata = artifact.get("metadata", {})
-    graph_k = int(metadata.get("graph_k", 200))
+    graph_k = int(metadata.get("graph_k", 100))
     holdout_frac = float(metadata.get("holdout_edge_frac", 0.0))
     holdout_seed = int(metadata.get("holdout_seed", 0))
     print(
@@ -381,6 +414,9 @@ def main() -> int:
             "  NOTE: this artifact withheld no edges, so the `heldout_edges` set "
             "is empty and only `nonlocal` / `unsupervised` are reported"
         )
+    labels, _ = reciprocal_component_labels(artifact["transition_neighbors"].numpy())
+    n_components = int(labels.max()) + 1 if labels.size else 0
+    print(f"  training graph: {n_components} reciprocal components")
 
     rng = np.random.default_rng(args.seed)
     anchors = rng.choice(len(texts), size=min(args.anchors, len(texts)), replace=False)
@@ -411,7 +447,7 @@ def main() -> int:
             )
 
     # Every metric's ranking pool: the widest set of columns no arm was trained
-    # on. `unsupervised` is a superset of the other two sets by construction, so
+    # on. `unsupervised` is a superset of every other set by construction, so
     # each of them is scored as a retrieval problem against the same wide field.
     ranking_pool = masks["unsupervised"]
 
@@ -439,6 +475,7 @@ def main() -> int:
         "n_anchors",
         "graph_k",
         "holdout_frac",
+        "reciprocal_components",
         "weights",
     ]
     out_path = Path(args.out)
@@ -479,6 +516,7 @@ def main() -> int:
                         "n_anchors": len(anchors),
                         "graph_k": graph_k,
                         "holdout_frac": holdout_frac,
+                        "reciprocal_components": n_components,
                         "weights": str(weights),
                         **{
                             key: (
@@ -490,7 +528,7 @@ def main() -> int:
                 )
                 handle.flush()
                 print(
-                    f"    {name:<14} spearman={metrics.get('spearman', float('nan')):.4f} "
+                    f"    {name:<24} spearman={metrics.get('spearman', float('nan')):.4f} "
                     f"recall@{args.knn_k}={metrics.get('knn_recall', float('nan')):.4f} "
                     f"order={metrics.get('pair_order', float('nan')):.4f}"
                 )

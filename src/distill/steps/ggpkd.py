@@ -1,6 +1,7 @@
 """The ggpkd training step.
 
-Reads from the distiller context: config, device_s, model_student, criterion, optimizer, scaler, scheduler, current_epoch, current_step
+Reads from the distiller context: config, device_s, model_student, criterion,
+optimizer, scaler, scheduler, current_epoch, current_step.
 """
 
 import math
@@ -12,90 +13,47 @@ from src.distill.numerics import is_finite, total_grad_norm
 
 
 def step(ctx, batch: dict) -> tuple[torch.Tensor, dict]:
-    cfg = ctx.config
-    batch_s = {}
-    for k, v in batch.items():
-        if not torch.is_tensor(v):
-            continue
-        if k.endswith("_stu") or k in {
-            "labels",
-            "idx",
-            "candidate_idx",
-            "candidate_inverse",
-            "teacher_probs",
-        }:
-            batch_s[k] = v.to(ctx.device_s, non_blocking=True)
+    device = ctx.device_s
+    pool_idx = batch["pool_idx"].to(device, non_blocking=True)
+    anchor_pos = batch["anchor_pos"].to(device, non_blocking=True)
+    pool_inverse = batch["pool_inverse"].to(device, non_blocking=True)
+    cal_exclude = batch.get("cal_exclude")
+    if cal_exclude is not None:
+        cal_exclude = cal_exclude.to(device, non_blocking=True)
 
     ctx.optimizer.zero_grad(set_to_none=True)
 
+    # Encoder budget, counted where the encoding happens. Read off the CPU batch:
+    # int() on a CUDA tensor would sync every step for a counter.
+    encoded_texts = 0
+    encoded_tokens = 0
     with autocast("cuda", enabled=torch.cuda.is_available()):
-        s_out1 = ctx.model_student(
-            input_ids=batch_s["input_ids1_stu"],
-            attention_mask=batch_s["attention_mask1_stu"],
-            return_dict=True,
-            output_hidden_states=False,
-        )
-
-        # A second encoder pass for a SimCSE term used to sit here, gated on
-        # `lambda_simcse`. That knob was declared on no config (ggpkd_config.py
-        # records its removal), so the gate was constantly False and the pass never
-        # ran; it is dropped with the rest of the multi-layer branch it belonged to.
-
-        # Candidates arrive deduplicated and grouped by length, so each chunk
-        # pads to its own longest member. `candidate_inverse` expands the
-        # encoded rows back to the flat [batch_size * candidate_size] layout
-        # the criterion expects; the gather is differentiable, so a candidate
-        # shared by several anchors accumulates all of their gradient.
-
-        chunk_embeddings_single = []
-
-        # Encoder budget, counted where the encoding actually happens. Support
-        # policies dedup differently -- a draw concentrated on the same columns
-        # costs fewer unique texts than a spread one at the same quota -- so
-        # "equal candidate quota" is not "equal compute", and an ablation compared
-        # at equal quota alone would credit a policy for buying more forward
-        # passes. These two counters are what the arms are matched on.
-        # getattr rather than a bare += : the step is also driven by contexts that
-        # are not the distiller (the train-step contract tests build a minimal one),
-        # and a diagnostic counter must not be what decides whether the step runs.
-        # Read off `batch`, not `batch_s`: the latter lives on the GPU, and
-        # int() on a CUDA tensor blocks until the queue drains -- a per-step sync
-        # in the training loop, paid for a counter. The two hold the same values.
-        encoded_texts = int(batch["input_ids1_stu"].size(0))
-        encoded_tokens = int(batch["attention_mask1_stu"].sum())
-
-        for chunk in batch["candidate_chunks"]:
-            chunk_out = ctx.model_student(
-                input_ids=chunk["input_ids"].to(ctx.device_s, non_blocking=True),
-                attention_mask=chunk["attention_mask"].to(
-                    ctx.device_s, non_blocking=True
-                ),
+        chunk_embeddings = []
+        for chunk in batch["pool_chunks"]:
+            out = ctx.model_student(
+                input_ids=chunk["input_ids"].to(device, non_blocking=True),
+                attention_mask=chunk["attention_mask"].to(device, non_blocking=True),
                 return_dict=True,
                 output_hidden_states=False,
             )
+            chunk_embeddings.append(out.last_hidden_state[:, 0, :])
             encoded_texts += int(chunk["input_ids"].size(0))
             encoded_tokens += int(chunk["attention_mask"].sum())
-
-            chunk_embeddings_single.append(chunk_out.last_hidden_state[:, 0, :])
-
-        ctx.encoded_texts_total = getattr(ctx, "encoded_texts_total", 0) + encoded_texts
-        ctx.encoded_tokens_total = (
-            getattr(ctx, "encoded_tokens_total", 0) + encoded_tokens
+        # Back from encode order to pool order. The gather is differentiable, so a
+        # text shared by several rows accumulates all of their gradient.
+        pool_embeddings = torch.cat(chunk_embeddings, dim=0).index_select(
+            0, pool_inverse
         )
-
-        S_cls1 = s_out1.last_hidden_state[:, 0, :]
-        S_candidates = torch.cat(chunk_embeddings_single, dim=0).index_select(
-            0, batch_s["candidate_inverse"]
-        )
-
         loss, metrics = ctx.criterion(
-            anchor_embeddings=S_cls1,
-            candidate_embeddings=S_candidates,
-            teacher_probs=batch_s["teacher_probs"],
-            candidate_idx=batch_s.get("candidate_idx"),
-            anchor_idx=batch_s.get("idx"),
+            pool_embeddings=pool_embeddings,
+            pool_idx=pool_idx,
+            anchor_pos=anchor_pos,
+            cal_exclude=cal_exclude,
         )
         loss = loss.float()
+
+    ctx.encoded_texts_total = getattr(ctx, "encoded_texts_total", 0) + encoded_texts
+    ctx.encoded_tokens_total = getattr(ctx, "encoded_tokens_total", 0) + encoded_tokens
 
     if not is_finite(loss):
         raise RuntimeError(
@@ -104,23 +62,16 @@ def step(ctx, batch: dict) -> tuple[torch.Tensor, dict]:
 
     ctx.scaler.scale(loss).backward()
     ctx.scaler.unscale_(ctx.optimizer)
-
-    # Reported, not enforced: the gradients reach the optimizer at their own
-    # magnitude. See src/distill/numerics.py for why the 1.0 ceiling was removed.
-    # This single read is also the finiteness check -- the norm is NaN/Inf exactly
-    # when some gradient is -- so it replaces a second full walk of the gradients.
+    # Reported, not enforced; the norm is also the finiteness check.
     metrics["grad_norm"] = float(total_grad_norm(ctx.optimizer))
     if not math.isfinite(metrics["grad_norm"]):
         ctx.optimizer.zero_grad(set_to_none=True)
         ctx.scaler.update()
-        # Advance the schedule even on a skipped update: it was built for
-        # len(train_loader) * epochs steps, so returning early here leaves
-        # the LR permanently behind the cosine curve it was sized for.
+        # Keep the schedule aligned with the step count it was built for.
         ctx.scheduler.step()
         return loss, {**metrics, "skip": "grad_inf"}
 
     ctx.scaler.step(ctx.optimizer)
     ctx.scaler.update()
     ctx.scheduler.step()
-
     return loss, metrics

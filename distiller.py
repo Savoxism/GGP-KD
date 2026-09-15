@@ -420,7 +420,7 @@ class KnowledgeDistiller:
         if mode == "random":
             return None
 
-        from src.data_utils.batch_samplers import TeacherBatchSampler
+        from src.data_utils.batch_samplers import NeighborBatchSampler
 
         artifact = getattr(self, "ggpkd_artifact", None)
         if artifact is None:
@@ -441,8 +441,7 @@ class KnowledgeDistiller:
             print(f"Batch composition reads the prebuilt graph: {path}")
             artifact = torch.load(path, map_location="cpu", weights_only=False)
         neighbors = artifact["transition_neighbors"].numpy()
-        sampler = TeacherBatchSampler(
-            mode=mode,
+        sampler = NeighborBatchSampler(
             neighbors=neighbors,
             batch_size=self.config.batch_size,
             seed=self.config.seed,
@@ -715,7 +714,7 @@ class KnowledgeDistiller:
                 )
 
             concise_metrics = (
-                ("rel", "loss_rel", True),
+                ("cal", "loss_cal", True),
                 (
                     "row",
                     "loss_row_weighted",
@@ -757,27 +756,16 @@ class KnowledgeDistiller:
         # have nothing to do with training. Print the example-weighted epoch means.
         if epoch_means:
             headline = [
-                "loss_rel",
-                "loss_amb",
-                "loss_nbr",
-                "loss_diff",
-                "loss_row_weighted",
+                "loss_total",
+                "loss_cal",
+                "loss_row",
+                "row_share",
+                "pool_size",
                 "row_count",
+                "row_eff_denom",
                 "row_exposed_mass",
-                "row_valid_ratio",
-                "js_floor",
-                "loss_excess",
-                "target_entropy",
-                "student_entropy",
-                "student_entropy_ratio",
-                "student_top1",
-                "target_top1",
-                "candidates_per_anchor",
             ]
             shown = [k for k in headline if k in epoch_means]
-            semantic_kls = ("kl_amb", "kl_nbr")
-            shown += [k for k in semantic_kls if k in epoch_means]
-            shown += sorted(k for k in epoch_means if k.startswith("kl_diff_r"))
             body = "  ".join(f"{k}={epoch_means[k]:.4f}" for k in shown)
             print(f"[Epoch {epoch + 1}] mean over {n_items} examples: {body}")
 

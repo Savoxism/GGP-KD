@@ -1,10 +1,7 @@
-"""Shared reader for the run trees written by the GGPKD runners.
+"""Benchmark table and score reader for the run trees written by scripts/exp.
 
-Both aggregators -- summarize.py (per pair) and summarize_sensitivity.py (per
-arm) -- read the same three files per training run and apply the same
-validation, so that logic lives here rather than being kept in step across two
-copies. Only the directory layout differs, which is why the callers pass paths
-rather than a pair or an arm name.
+scripts/exp/export_runs.py reads every run's scores through this module, so the
+task list, the in/out-of-domain split and the metric per task are defined once.
 """
 
 from __future__ import annotations

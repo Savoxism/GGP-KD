@@ -53,123 +53,65 @@ def parse_args():
         "--max_length", type=int, default=None, help="Maximum sequence length"
     )
 
-    # GGPKD experiment overrides. Keeping these on the CLI lets concurrent
-    # teacher-student pairs use isolated caches without rewriting the shared
-    # default config.
+    # GGPKD. Every flag defaults to the method (story.md §2); the ablation
+    # switches are the arms of story.md Tables 3-6.
     parser.add_argument("--graph_k", type=int, default=None)
+    parser.add_argument(
+        "--neighbor_source", choices=["teacher", "student"], default=None
+    )
+    parser.add_argument("--knn_mode", choices=["directed", "mutual"], default=None)
     parser.add_argument(
         "--fixed_bandwidth",
         action="store_true",
-        help="Baseline arm: one shared graph temperature instead of the per-row "
-        "bandwidth derived from graph_k",
-    )
-    parser.add_argument("--truncation_tolerance", type=float, default=None)
-    parser.add_argument(
-        "--r0_weight",
-        type=float,
-        default=None,
-        help="Independent coefficient of the ambient/calibration loss L_r0",
-    )
-    parser.add_argument(
-        "--r1_weight",
-        type=float,
-        default=None,
-        help="Independent coefficient of the graph-transition loss L_r1",
-    )
-    parser.add_argument("--row_weight", type=float, default=None)
-    parser.add_argument("--diffusion_quota", type=int, default=None)
-    # Ablation switches. Each defaults to the method's value,
-    # so omitting all four reproduces the full model exactly.
-    parser.add_argument(
-        "--support_policy",
-        choices=[
-            "topk",
-            "proportional",
-            "uniform",
-            "local_topk",
-            "corpus_uniform",
-            "rewired",
-        ],
-        default=None,
-        help="Support-selection arm: topk (method), proportional, uniform, "
-        "local_topk (r=1-only support), corpus_uniform (columns drawn from the "
-        "whole corpus) or rewired (degree-matched rewiring). The last two leave "
-        "the graph, so they require --relation_target direct, an explicit "
-        "--diffusion_quota, and read L_row targets from the teacher-valued graph",
-    )
-    parser.add_argument(
-        "--relation_target",
-        choices=["transition", "diffusion", "direct", "ambient_only", "uniform"],
-        default=None,
-        help="Target on the selected columns: transition (method), direct teacher "
-        "cosine, ambient_only (no graph relations at all), or uniform (equal mass "
-        "on every retrieved neighbour, same columns and tau_i)",
-    )
-    parser.add_argument(
-        "--knn_mode",
-        choices=["mutual", "directed", "symmetrized"],
-        default=None,
-        help="kNN edge rule for the cached graph: directed (method), mutual, symmetrized",
-    )
-    parser.add_argument(
-        "--neighbor_source",
-        choices=["teacher", "student"],
-        default=None,
-        help="Whose kNN decides each row's columns: the frozen base student "
-        "(method) or the teacher (ablation). The teacher supplies target cosines, "
-        "transition probabilities and row temperatures in both cases",
-    )
-    parser.add_argument(
-        "--row_centers",
-        choices=["teacher", "random"],
-        default=None,
-        help="Columns L_row scores each extra anchor against: its cached graph "
-        "neighbours in the pool (method) or as many random pool columns",
-    )
-    parser.add_argument(
-        "--batch_local",
-        action="store_true",
-        help="Batch-local relational KD baseline: relations among the batch only, "
-        "no graph and no candidate draw. Defaults to --relation_target "
-        "ambient_only; pass --relation_target direct for the arm that is "
-        "temperature-matched to the graph-support arms (per-anchor tau_i)",
-    )
-    parser.add_argument(
-        "--no_ambient",
-        action="store_true",
-        help="Compatibility alias for --calibration_mode none",
-    )
-    parser.add_argument(
-        "--calibration_mode",
-        choices=["none", "pool"],
-        default=None,
-        help="Calibration loss domain: the batch-shared candidate pool, or none",
-    )
-    parser.add_argument(
-        "--batch_sampler",
-        choices=["random", "teacher_neighbor", "teacher_diverse"],
-        default=None,
-        help="Batch composition (E1, batch intervention): random (method), "
-        "teacher_neighbor (batch drawn from one teacher neighbourhood) or "
-        "teacher_diverse (batch spread across distant neighbourhoods)",
+        help="One median bandwidth for every row instead of the per-row tau_j",
     )
     parser.add_argument(
         "--holdout_edge_frac",
         type=float,
         default=None,
-        help="Fraction of cached graph edges withheld from every training "
-        "support (E3). The withheld edges are stored in the artifact for the "
-        "post-hoc held-out geometry evaluation; 0 is the method",
+        help="Fraction of graph edges withheld from every training term (Table 4)",
+    )
+    parser.add_argument("--holdout_seed", type=int, default=None)
+    parser.add_argument(
+        "--cal_weight", type=float, default=None, help="Weight of L_cal"
     )
     parser.add_argument(
-        "--holdout_seed",
-        type=int,
-        default=None,
-        help="Which edges the holdout takes. Deliberately independent of --seed: "
-        "the split must be identical across seeds and arms",
+        "--row_weight", type=float, default=None, help="Weight of L_row"
     )
-    parser.add_argument("--hard_neg_k", type=int, default=None)
-    parser.add_argument("--random_neg_k", type=int, default=None)
+    parser.add_argument(
+        "--row_set",
+        choices=["all", "anchors", "non_anchors"],
+        default=None,
+        help="Which pool texts are supervised rows",
+    )
+    parser.add_argument(
+        "--row_target",
+        choices=["teacher", "uniform"],
+        default=None,
+        help="Row target values: teacher softmax (method) or uniform on the same columns",
+    )
+    parser.add_argument(
+        "--row_columns",
+        choices=["graph", "random"],
+        default=None,
+        help="Row columns: graph neighbours in the pool (method) or random pool texts",
+    )
+    parser.add_argument(
+        "--row_reweight",
+        action="store_true",
+        help="Weight each row by 1/P(text in pool) (GraphSAINT normalization)",
+    )
+    parser.add_argument(
+        "--batch_local",
+        action="store_true",
+        help="In-batch baseline: the pool is the batch and the loss is L_cal only",
+    )
+    parser.add_argument(
+        "--batch_sampler",
+        choices=["random", "neighbor"],
+        default=None,
+        help="Batch composition: i.i.d. (method) or one graph neighbourhood per batch",
+    )
     parser.add_argument("--cache_path", type=str, default=None)
     parser.add_argument("--ggpkd_cache_path", type=str, default=None)
     parser.add_argument("--ggpkd_log_dir", type=str, default=None)
@@ -277,58 +219,34 @@ def get_config(method: str, args):
 
     ggpkd_overrides = (
         "graph_k",
-        "truncation_tolerance",
-        "r0_weight",
-        "r1_weight",
+        "neighbor_source",
+        "knn_mode",
+        "holdout_edge_frac",
+        "holdout_seed",
+        "cal_weight",
         "row_weight",
-        "diffusion_quota",
-        "hard_neg_k",
-        "random_neg_k",
+        "row_set",
+        "row_target",
+        "row_columns",
+        "batch_sampler",
         "cache_path",
         "ggpkd_cache_path",
         "ggpkd_log_dir",
         "pooling_method",
-        "support_policy",
-        "relation_target",
-        "knn_mode",
-        "neighbor_source",
-        "row_centers",
-        "batch_sampler",
-        "holdout_edge_frac",
-        "holdout_seed",
     )
     for name in ggpkd_overrides:
         value = getattr(args, name)
         if value is not None:
             setattr(config, name, value)
-    # None already means "leave the config unchanged", so 0 disables the
-    # entropic-affinity bandwidth and selects the fixed-bandwidth baseline.
-    if args.fixed_bandwidth:
-        config.fixed_bandwidth = True
-    if args.calibration_mode is not None:
-        config.calibration_mode = args.calibration_mode
-
-    # A store_true flag cannot express "leave the config alone". Keep it as a
-    # compatibility alias, but reject two contradictory objective requests.
-    if args.no_ambient:
-        if args.calibration_mode not in (None, "none"):
-            raise ValueError(
-                "--no_ambient conflicts with "
-                f"--calibration_mode {args.calibration_mode}"
-            )
-        config.calibration_mode = "none"
-
-    # The baseline has no graph relations to target, so the objective it implies
-    # is forced rather than left to be passed consistently by hand. Setting it
-    # here keeps it in the run manifest as a concrete value.
+    for name in ("fixed_bandwidth", "row_reweight"):
+        if getattr(args, name):
+            setattr(config, name, True)
     if args.batch_local:
         config.batch_local = True
-        # Only a default. `--relation_target direct` scores the same batch columns
-        # at the anchor's own tau_i instead of the single ambient temperature,
-        # which is what makes the in-batch arm one factor away from a
-        # teacher-support arm rather than two.
-        if args.relation_target is None:
-            config.relation_target = "ambient_only"
+        # The baseline has no graph rows, so L_row is off unless asked for (and
+        # then validate() refuses it).
+        if args.row_weight is None:
+            config.row_weight = 0.0
 
     if args.w_task is not None:
         config.w_task = args.w_task

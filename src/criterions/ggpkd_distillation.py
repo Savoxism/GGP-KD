@@ -1,3 +1,25 @@
+"""GGPKD loss: row-conditional matching on a step's pool, plus pool calibration.
+
+    L = row_weight * L_row + cal_weight * L_cal
+
+L_row   For every supervised pool text j,
+            KL( P^T_j|Omega_j || P^S_j|Omega_j ),   Omega_j = N(j) ∩ pool,
+        both sides softmaxes at the row's own tau_j, renormalized on Omega_j. By
+        Luce's choice axiom a partial row is an exact constraint: its zero set is
+        s^S_ju - s^T_ju = const_j on Omega_j (story.md §3, Lemma 1). An anchor's
+        Omega_i is its whole row.
+L_cal   For every anchor i, KL between the teacher's and the student's softmax
+        over the whole pool at one temperature (the median tau_j). It is the only
+        term that scores pairs outside the graph (Proposition 2).
+
+Ablation switches, each at the method's value by default (story.md, Tables 3-6):
+
+    row_set        all | anchors | non_anchors   which pool texts are rows
+    row_target     teacher | uniform             values on the same columns
+    row_columns    graph | random                same width, random pool columns
+    row_inclusion  None | P(j in pool)           weight rows by 1 / p_j
+"""
+
 import math
 from collections.abc import Sequence
 
@@ -5,1431 +27,309 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from src.ggpkd.policy import (
-    DIAG_TOPK,
-    EPS_NORM,
-    FIXED_BANDWIDTH_TEMP,
+from src.ggpkd.policy import EPS_NORM
+
+ROW_SETS = ("all", "anchors", "non_anchors")
+ROW_TARGETS = ("teacher", "uniform")
+ROW_COLUMNS = ("graph", "random")
+
+_ROW_METRICS = (
+    "row_count",
+    "row_eff_denom",
+    "row_exposed_mass",
+    "row_exposed_mass_p10",
+    "row_exposed_mass_p90",
+    "row_teacher_entropy",
+    "row_kl_p50",
+    "row_kl_p90",
+    "row_ess_ratio",
 )
 
-# "diffusion" is accepted as the former spelling of "transition": at the
-# method's single hop the target is the teacher transition row, and calling it
-# a diffusion target named a composition step that no longer runs.
-# "uniform" is the Stage 1.3 control: the transition row's columns and per-row
-# temperature, with equal mass on every retrieved neighbour.
-RELATION_TARGETS = ("transition", "direct", "ambient_only", "uniform")
-RELATION_TARGET_ALIASES = {"diffusion": "transition"}
-CALIBRATION_MODES = ("none", "pool")
-# Which columns L_row scores an extra anchor j against: the teacher's N_j inside
-# the pool (method), or the same number of pool columns drawn at random (1.1b).
-ROW_CENTERS = ("teacher", "random")
+
+def _assert_finite(named: Sequence[tuple[str, torch.Tensor]]) -> None:
+    for name, tensor in named:
+        if not bool(torch.isfinite(tensor).all()):
+            raise RuntimeError(
+                f"GGPKD non-finite tensor {name!r}: shape={tuple(tensor.shape)}, "
+                f"nan={int(torch.isnan(tensor).sum())}, inf={int(torch.isinf(tensor).sum())}"
+            )
 
 
-def _assert_finite_tensors(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> None:
-    finite_status = None
-    for _, tensor in named_tensors:
-        current = torch.isfinite(tensor).all()
-        finite_status = current if finite_status is None else finite_status & current
+def _kl_rows(target: torch.Tensor, log_q: torch.Tensor) -> torch.Tensor:
+    """Row-wise KL(target || q); columns with zero target contribute nothing."""
+    positive = target > 0
+    log_p = torch.where(
+        positive, target.clamp_min(1e-12).log(), torch.zeros_like(target)
+    )
+    return torch.where(
+        positive, target * (log_p - log_q), torch.zeros_like(target)
+    ).sum(-1)
 
-    if finite_status is None or bool(finite_status.item()):
-        return
 
-    for name, tensor in named_tensors:
-        if bool(torch.isfinite(tensor).all().item()):
-            continue
-        if tensor.is_floating_point() or tensor.is_complex():
-            nan_count = int(torch.isnan(tensor).sum().item())
-            inf_count = int(torch.isinf(tensor).sum().item())
-        else:
-            nan_count = 0
-            inf_count = 0
-        raise RuntimeError(
-            f"GGPKD non-finite tensor {name!r}: shape={tuple(tensor.shape)}, "
-            f"dtype={tensor.dtype}, device={tensor.device}, "
-            f"nan_count={nan_count}, inf_count={inf_count}"
-        )
+def _entropy(p: torch.Tensor) -> torch.Tensor:
+    positive = p > 0
+    return -torch.where(
+        positive, p * p.clamp_min(1e-12).log(), torch.zeros_like(p)
+    ).sum(-1)
 
 
 class GGPKDDistillation(nn.Module):
-    r"""Multi-resolution diffusion matching.
-
-    L = sum_r omega_r KL(p^T_r || p^S_r),  p^S_r(j) = softmax_j(cos(s_i,s_j) / tau_r)
-
-    **Why the student distribution is scale-dependent.** With one shared student
-    distribution p^S the objective collapses exactly onto a single-scale one:
-    cross-entropy is linear in the target, so
-
-        sum_r omega_r KL(p^T_r || p^S)
-            = -sum_r omega_r H(p^T_r) + CE(pbar, p^S),   pbar = sum_r omega_r p^T_r,
-
-    and the first term is a precomputed constant. Every choice of scale set that
-    yields the same mixture pbar produces the same gradient, so "multi-scale" would
-    be nothing more than target smoothing. Two further consequences follow:
-
-    * the loss can never drop below JS_omega(p^T_1, ..., p^T_R) = H(pbar) -
-      sum_r omega_r H(p^T_r); that floor is computable offline from the artifact,
-      and a loss curve that flattens near it means the objective is exhausted, not
-      that optimization stalled;
-    * a single softmax pins cos(s_i, s_j) only up to a per-anchor additive constant,
-      so nothing constrains similarity levels *across* anchors -- which is exactly
-      what STS Spearman and a single global cosine threshold need.
-
-    Giving each scale its own temperature tau_r removes both problems. Matching the
-    same candidate similarities at several resolutions is over-determined, so the
-    student has to reproduce the teacher's cosine *gaps*, not just its ranking, and
-    the scales stop being redundant.
-
-    **In-batch candidate sharing.** Every anchor is scored against the union of all
-    candidates in the batch, deduplicated by corpus index and with the anchor's own
-    row masked out. Encoding cost is unchanged, negatives per anchor go up by a
-    factor of the batch size, and the shared columns couple anchors, which is what
-    makes similarity levels comparable across the batch.
-
-    **The ambient scale, and why it is not optional.** Its current role is stated
-    four paragraphs down, under *What changed when the negatives were removed*:
-    after the domain split it is the only term that scores a pair (i, j) with j
-    outside N_i, which makes it the only term that constrains geometry *between*
-    neighbourhoods, fixes the absolute cosine scale, and stops the whole space
-    collapsing. What follows is the argument that introduced it, kept because the
-    failure it describes is what the domain split was built to remove.
-
-    The diffusion targets are the
-    graph's mass renormalized over the scored columns, so every column outside the
-    anchor's diffusion pool receives target *exactly zero*. That is not a neutral
-    "no information" value: the gradient of the cross-entropy at such a column is
-    +p^S(j), which pushes cos(s_i, s_j) down without bound. Under in-batch sharing
-    roughly 97% of the columns an anchor sees are zero-target, and they include the
-    hard negatives -- same-source, top-200 by teacher cosine, outside the graph as
-    it was then built -- whose true teacher similarity is high. The objective is
-    therefore actively training the student to drive apart pairs the teacher calls
-    similar, which is exactly the calibration STS and a global cosine threshold
-    depend on.
-
-    Scale r=0 fixes this by targeting the teacher's own similarity over the full
-    column set,
-
-        p^T_0(j) = softmax_j( cos(t_i, t_j) / tau_t ),
-
-    which is dense: every scored column gets its true teacher mass instead of a
-    false zero. It costs nothing (the teacher embeddings are already cached), and it
-    anchors the selected relations against the broader shared candidate pool.
-
-    **Separate column domains, and why adding r=0 was not enough on its own.**
-    Adding r=0 alongside diffusion scales that still softmax over the whole shared
-    pool does not remove the false zeros -- it adds a term that argues with them. The
-    diffusion scales keep pushing ~900 of ~965 columns down; r=0 spends its weight
-    pulling the same columns back up. On the 13.5k-row run the two sides disagreed by
-    JS = 0.42 nats, 61% of the maximum possible for a two-way split, and that
-    disagreement accounted for 94% of an irreducible loss floor of 0.45. Against a
-    total loss of 0.84 that left only 0.39 nats reachable, the student closed 99.4% of
-    it inside one epoch, and every benchmark was flat from epoch 1 onward.
-
-    The fix is to give the two families different column sets. Diffusion scales
-    softmax over the anchor's *own* candidate draw, where their zeros are real
-    teacher judgements (a hard negative genuinely carries no diffusion mass); r=0
-    softmaxes over the full shared pool, where every column carries real teacher mass.
-    Neither term has an opinion the other contradicts: diffusion ranks within the
-    neighbourhood, r=0 calibrates across the batch.
-
-    **What changed when the negatives were removed.** The two paragraphs above
-    are the argument that introduced scale r=0, and they are stated against the
-    draw as it was then: a candidate row of 23 diffusion-support columns plus 66
-    hard and uniform negatives, all softmaxed over the whole shared pool. Two
-    things have since moved, and the second one is recent enough that the history
-    is worth keeping visible rather than rewritten.
-
-    First the domain split confined the diffusion softmax to the anchor's own
-    draw. Then the negative quotas went to zero, so that draw is now nothing but
-    columns the teacher put diffusion mass on. Together those mean the diffusion
-    group scores **no zero-target column at all** -- the false-zero gradient that
-    r=0 was introduced to counteract is gone by construction rather than by
-    counterweight, and `amb_mass_on_zero_diff` should read ~0 on every batch.
-
-    That does not make the ambient scale redundant: it is still the only term
-    that compares similarity levels *across* anchors, which is what STS Spearman
-    and a single global cosine threshold read. But its column set has changed
-    character. It used to span ~4,445 pool columns per batch, of which ~1,160
-    were uniform corpus draws belonging to no anchor's neighbourhood; it now
-    spans ~1,400, every one of which is some anchor's graph-selected
-    neighbour. The calibration r=0 performs is therefore local where it used to
-    reach across the corpus. That is the standing risk of the no-negatives
-    method, and the out-of-domain pair and STS benchmarks are where it would
-    surface first.
-
-    **Why there is no pointwise anchor term.** An earlier version added
-    lambda_anchor * (1 - cos(W_a s_i, t_i)) with a free linear map W_a. That term is
-    invariant to any invertible transform of the student space -- W_a simply absorbs
-    it -- so it cannot pin absolute similarity levels no matter how it is weighted,
-    which is the one thing it was introduced to do. The ambient scale supplies that
-    comparison properly, by comparing the teacher's *relative* similarities over a
-    shared column set rather than comparing cosines across two different metrics. The
-    term has been removed rather than left at weight 0: it also made the criterion
-    carry trainable parameters, and a knob that cannot work is worse than no knob.
-
-    **Row supervision.** Diffusion KL supervises only rows indexed by batch anchors.
-    L_row adds rows centred on *non-anchor* nodes whose embeddings are already in the
-    shared candidate pool, matching the teacher's one-step transition row on the
-    teacher-neighbour columns the pool happens to expose:
-
-        L_row = sum_j nu_B(j) KL(P^T_j|Omega_j || p^S_j|Omega_j),
-        Omega_j = (teacher neighbours of j) ∩ (shared pool),
-
-    with the dense transition row as target rather than a sampled successor, so this
-    is row-kernel matching and not a trajectory likelihood. Each row uses its own
-    stored graph bandwidth. Rows with fewer than two available columns are dropped:
-    a KL on a singleton support is identically zero.
-
-    The rows are exactly the pool columns that some anchor's candidate draw selected
-    for their *teacher mass* -- the diffusion support, not the hard or uniform
-    negatives, which were chosen for reasons that say nothing about their own
-    neighbourhood -- and nu_B is uniform over them. Batch anchors are excluded:
-    their transition row is already the r=1 diffusion target of L_rel, so promoting
-    them would duplicate a term rather than add one.
-
-    Nothing is discovered stochastically here. The row set is a deterministic
-    function of the pool, so L_row reuses computation L_rel already paid for and
-    carries no selection hyperparameter of its own; candidate selection upstream is
-    still a sampling procedure, but this term adds no traversal process to it.
-
-    **Four alternatives were implemented, measured, and removed** (Qwen3-0.6B ->
-    MiniLMv2-H384, seed 42, 5 epochs; the code is in git history at b1f683b and
-    earlier). Each lost, and together they say the mechanism above is not an
-    arbitrary choice among many:
-
-    * *Non-backtracking teacher walks* to discover the rows, nu_B the visit count:
-      74.88 against uniform closure's 74.86 -- a tie, bought with two
-      hyperparameters (num_walks, walk_length) that never appear in the objective,
-      because the trajectory was only ever used to pick rows. Its measured
-      row_node_hit_ratio of 0.997 also showed the walk was not finding rows already
-      in the pool: the sampler *inserted* visited nodes into the candidate draw,
-      displacing uniform negatives, so the walk was modifying the pool to contain
-      its own rows.
-    * *Weighting by exposed mass*, nu_B(j) proportional to m_B(j) = P^T_j(Omega_j):
-      74.76. Selection is already mass-proportional, so weighting by mass again
-      squares the bias toward hubs deep inside some anchor's neighbourhood -- which
-      is exactly where the row's transition target most nearly duplicates the r=1
-      target L_rel already gives that anchor.
-    * *Inverse-inclusion weighting*, nu_B(j) proportional to 1/c_B(j) with c_B(j)
-      the number of anchors selecting column j: measured inert. At 13.5k corpus and
-      64x14 support per batch, c_B(j) = 1 for ~99% of rows, so the effective row
-      count moved 1.3% (833.6 of 844.3) -- a within-batch plug-in cannot see an
-      inclusion bias that acts across batches.
-    * *An ambient r=0 term for each row* (dense teacher-similarity target over the
-      whole pool at direct_temp, weight tied omega_amb = omega_1), motivated by
-      row_exposed_mass = 0.44: the restricted target renormalizes less than half of
-      each row's true transition mass, in a method whose every other truncation is
-      held to 1%. It cost -0.30 on out-of-domain, the exact benchmarks it was meant
-      to calibrate, at unchanged in-domain. So the open support is not a practical
-      weakness, and restricted transition matching is the active ingredient of
-      L_row rather than something needing a calibration companion.
-
-    **Temperature ties.** The temperatures are not free parameters and are
-    therefore not constructor arguments:
-
-    * ``tau_1 = graph_temp``: the r=1 target after dropping self-mass IS the
-      transition row, a softmax of teacher cosines at graph_temp. Matching it at
-      the same temperature makes zero loss attainable exactly on the shift family
-      cos_S = cos_T + a_i; any other temperature forces the affine family
-      cos_S = (tau_1/graph_temp) cos_T + a_i, which contradicts the ambient scale
-      on the same row (it pins unrescaled gaps), so the joint zero set is empty
-      unless the teacher cosines are constant.
-
-      With ``row_temps`` supplied -- the entropic-affinity graph, where each row
-      is solved for a fixed perplexity instead of sharing one temperature -- the
-      tie is read row by row: row i's target was built at tau_i, so row i is
-      matched at tau_i. Nothing in the argument above depends on the *value* of
-      the temperature, only on the two sides sharing it, and the attainable set is
-      the same shift family; so the proposition holds per row.
-    * ``direct student temp = direct_temp``: the classic same-temperature
-      convention of distillation (Hinton et al., 2015). Unequal temperatures
-      make the direct target attainable only as a rescaling of teacher cosines,
-      which is the calibration distortion the scale exists to prevent.
-
-    * ``tau_r = sqrt(r) * tau_1`` for the broader diffusion scales: the spread of
-      a diffusion grows as sqrt of its time, so scale r is matched at the
-      resolution its own target already has. This is a stated rule, not a
-      derivation -- the lazy walk takes r/2 real steps in expectation, so a
-      strict derivation would carry a different constant -- but it removes the
-      last free student temperatures, and under ``row_temps`` it inherits the
-      per-row tie automatically: tau_r(i) = sqrt(r) * tau_i.
-
-    **Relational weights.** ``r0_weight`` and ``r1_weight`` are explicit,
-    independent non-negative coefficients for the ambient and one-hop graph
-    groups. They are applied directly, without normalization. Both default to
-    0.5, preserving the previous full objective.
-
-    Passing removed or derived knobs raises rather than being silently absorbed.
-    """
-
-    _TIED_KNOBS = {
-        "student_dim": (
-            "unused: the criterion carries no trainable parameters, so it never "
-            "needed the student width"
-        ),
-        "teacher_dim": (
-            "unused, as student_dim: the teacher width comes from teacher_embeddings"
-        ),
-        "row_mode": (
-            "L_row has one mechanism: the graph-selected pool columns, weighted "
-            "uniformly. Walk selection, exposed-mass weighting and inverse-inclusion "
-            "weighting were measured and removed -- see the class docstring"
-        ),
-        "row_ambient": (
-            "removed: the per-row ambient term cost 0.30 out-of-domain, the "
-            "benchmarks it was meant to calibrate"
-        ),
-        "num_walks": "removed with walk-based row selection",
-        "walk_length": "removed with walk-based row selection",
-        "scale_weights": (
-            "there is one graph scale; use r1_weight for its direct coefficient"
-        ),
-        "direct_weight": "renamed to r0_weight",
-        "share_in_batch": "in-batch sharing is always used when corpus indices exist",
-        "graph_temp": (
-            "canonical rows use their stored bandwidths; the scalar fixed-bandwidth "
-            "baseline is an internal constant"
-        ),
-        "scale_temps": (
-            "the whole ladder is derived: tau_1 is tied to graph_temp (or to the "
-            "per-row bandwidth) and tau_r = sqrt(r) * tau_1"
-        ),
-        "row_temp": "tied to the stored bandwidth of each supervised graph row",
-        "walk_temp": "use the derived per-row temperature; it is not configurable",
-        "walk_weight": "renamed to row_weight because the objective matches rows",
-        "mass_weight": "L_mass has been removed; use row_weight for L_row",
-        "geo_weight": "L_geo has been removed",
-        "unbiased_geometry_weight": (
-            "the head--tail geometry objective has been removed; geometry is "
-            "reported only by the evaluation probe"
-        ),
-        "sym_weight": "L_sym has been removed",
-        "use_ambient_scale": (
-            "one switch now: pass calibration_mode='none' to delete the r=0 scale"
-        ),
-        "direct_student_temp": (
-            "tied to direct_temp: the ambient scale uses one temperature on both "
-            "the teacher and the student side (Hinton et al., 2015)"
-        ),
-        "diffusion_scales": (
-            "multi-hop diffusion has been removed; the graph scale is the "
-            "teacher's one-hop transition row"
-        ),
-        "broad_scale_temps": (
-            "tied to the sharpest scale by tau_r = sqrt(r) * tau_1; pass "
-            "nothing instead: there is one graph scale, tied to its row bandwidth"
-        ),
-    }
-
     def __init__(
         self,
-        teacher_embeddings: torch.Tensor | None = None,
-        direct_temp: float = 0.10,
-        transition_neighbors: torch.Tensor | None = None,
-        transition_probs: torch.Tensor | None = None,
-        r0_weight: float = 0.5,
-        r1_weight: float = 0.5,
-        row_weight: float = 0.5,
-        row_temps: torch.Tensor | None = None,
-        relation_target: str = "transition",
-        calibration_mode: str | None = None,
-        row_centers: str = "teacher",
-        **kwargs,
+        teacher_embeddings: torch.Tensor,
+        transition_neighbors: torch.Tensor,
+        transition_probs: torch.Tensor,
+        row_temps: torch.Tensor,
+        cal_temp: float,
+        cal_weight: float = 0.5,
+        row_weight: float = 1.0,
+        row_set: str = "all",
+        row_target: str = "teacher",
+        row_columns: str = "graph",
+        row_inclusion: torch.Tensor | None = None,
     ):
         super().__init__()
-        for name, why in self._TIED_KNOBS.items():
-            if name in kwargs:
-                raise ValueError(f"GGPKDDistillation no longer accepts {name!r}: {why}")
-        self.graph_temp = FIXED_BANDWIDTH_TEMP
-
-        # Per-row temperatures (entropic affinities). The tie tau_1 =
-        # "the temperature this row's target was built at" is unchanged; it is
-        # simply no longer the same number for every row. Zero loss is still
-        # attainable exactly on the shift family cos_S(i,.) = cos_T(i,.) + a_i,
-        # which is independent of tau_i, so the attainability result carries over
-        # row by row.
-        if row_temps is not None:
-            temps_row = row_temps.detach().to(torch.float32).reshape(-1)
-            if not bool(torch.isfinite(temps_row).all()) or bool(
-                (temps_row <= 0).any()
-            ):
-                raise ValueError("row_temps must be finite and positive")
-            self.register_buffer("row_temps", temps_row, persistent=False)
-        else:
-            self.row_temps = None
-        self.eps_norm = EPS_NORM
-        self.diag_topk = DIAG_TOPK
-        # "transition" is the method. "direct" is the S3 control: identical selected
-        # columns, identical temperature, identical weight on the group -- only the
-        # target changes, from the composed multi-scale transition rows to the
-        # teacher's own cosine profile restricted to those same columns. It
-        # separates the value of the composed graph relations from the value of
-        # merely having selected farther nodes to supervise.
-        #
-        # "ambient_only" deletes the graph group outright and leaves the objective
-        # as one KL against the teacher's similarity profile over the scored
-        # columns. That is batch-local relational knowledge distillation in KL
-        # form, and it is the S1 baseline: no graph, no support selection, no rows.
-        # The group is *removed* rather than given a zero target so diagnostics and
-        # the executed objective both state exactly which loss terms are present.
-        relation_target = RELATION_TARGET_ALIASES.get(relation_target, relation_target)
-        if relation_target not in RELATION_TARGETS:
+        for name, value in (("cal_weight", cal_weight), ("row_weight", row_weight)):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative, got {value}")
+        if cal_weight == 0 and row_weight == 0:
             raise ValueError(
-                f"relation_target must be one of {RELATION_TARGETS}, "
-                f"got {relation_target!r}"
+                "at least one of cal_weight and row_weight must be positive"
             )
-        self.relation_target = relation_target
-        if not math.isfinite(r0_weight) or not math.isfinite(r1_weight):
-            raise ValueError("r0_weight and r1_weight must be finite")
-        if r0_weight < 0.0 or r1_weight < 0.0:
-            raise ValueError("r0_weight and r1_weight must be non-negative")
-        self.r0_weight = float(r0_weight)
-        self.r1_weight = float(r1_weight)
-        if row_weight < 0.0:
-            raise ValueError("row_weight must be non-negative")
-        self.row_weight = float(row_weight)
-        self.use_row_loss = False
-        if transition_neighbors is not None and transition_probs is not None:
-            self.register_buffer(
-                "row_neighbors", transition_neighbors.to(torch.int32), persistent=False
-            )
-            self.register_buffer(
-                "row_probs", transition_probs.to(torch.float32), persistent=False
-            )
-        else:
-            self.row_neighbors = None
-            self.row_probs = None
-            # Nothing else would notice a stale artifact: L_row would sit at exactly
-            # 0 for the whole run and look like a term that simply did not help.
-            # (The sampler used to raise for this, but only because walk selection
-            # needed the same arrays; it no longer reads them.) Fail here instead.
-            if self.row_weight > 0.0:
-                raise ValueError(
-                    "L_row needs the graph transition arrays; rebuild the GGPKD "
-                    "artifact (missing: transition_neighbors, transition_probs) or "
-                    "set row_weight=0"
-                )
-        self._warned_row_needs_sharing = False
+        for name, value, choices in (
+            ("row_set", row_set, ROW_SETS),
+            ("row_target", row_target, ROW_TARGETS),
+            ("row_columns", row_columns, ROW_COLUMNS),
+        ):
+            if value not in choices:
+                raise ValueError(f"{name} must be one of {choices}, got {value!r}")
+        if not math.isfinite(cal_temp) or cal_temp <= 0:
+            raise ValueError(f"cal_temp must be finite and positive, got {cal_temp}")
 
-        if self.relation_target in ("direct", "ambient_only") and (
-            teacher_embeddings is None
+        n_items = int(teacher_embeddings.size(0))
+        temps = row_temps.detach().float().reshape(-1)
+        if temps.numel() != n_items or tuple(transition_neighbors.shape[:1]) != (
+            n_items,
         ):
             raise ValueError(
-                f"relation_target={self.relation_target!r} reads the teacher bank; "
-                "pass teacher_embeddings"
+                "graph arrays and teacher embeddings disagree on the corpus size"
             )
-        if row_centers not in ROW_CENTERS:
-            raise ValueError(
-                f"row_centers must be one of {ROW_CENTERS}, got {row_centers!r}"
-            )
-        if row_centers == "random" and teacher_embeddings is None:
-            # A random column carries no transition mass, so its target can only
-            # be the teacher's cosine at tau_j -- which needs the bank.
-            raise ValueError(
-                "row_centers='random' scores L_row against the teacher bank; "
-                "pass teacher_embeddings"
-            )
-        self.row_centers = row_centers
-        # Two separate questions that used to have one answer.
-        #
-        #   *Is the bank here?*  -> `use_direct`. It decides what a target can be
-        #     computed from: `relation_target="direct"` reads teacher cosines over
-        #     whatever columns it is given, including columns carrying no graph
-        #     mass at all.
-        #   *Is scale r=0 in the loss?* -> `calibration_mode`. It decides what is
-        #     optimized.
-        #
-        # Conflating them made the minimal relational objective unreachable. The
-        # controlled support study needs exactly one KL per anchor over that
-        # anchor's own columns -- no ambient term, so nothing couples the anchors
-        # and batch composition cannot enter the loss -- while its random-support
-        # arms need `direct` targets, because a column drawn off-graph carries
-        # diffusion mass zero and would leave those arms with no objective. With
-        # one flag, asking for the first switched off the bank the second requires.
-        #
-        # `ambient_only` is the exception that stays coupled: it *is* scale r=0
-        # and nothing else, so removing the scale would leave no term at all.
-        # `pool` is the ambient loss over the candidate union supplied by the
-        # current mini-batch; `none` deletes the scale.
-        if calibration_mode is None:
-            calibration_mode = "pool"
-        if calibration_mode not in CALIBRATION_MODES:
-            raise ValueError(
-                f"calibration_mode must be one of {CALIBRATION_MODES}, "
-                f"got {calibration_mode!r}"
-            )
-        self.calibration_mode = calibration_mode
-        self.use_ambient_scale = calibration_mode != "none"
-        if self.relation_target == "ambient_only" and not self.use_ambient_scale:
-            raise ValueError(
-                "relation_target='ambient_only' is the ambient scale and nothing "
-                "else; calibration_mode='none' would leave the objective empty"
-            )
-        self.use_direct = teacher_embeddings is not None
-        active_relational_weight = (
-            (self.r0_weight if self.use_ambient_scale else 0.0)
-            + (self.r1_weight if self.relation_target != "ambient_only" else 0.0)
-        )
-        if active_relational_weight <= 0.0 and self.row_weight <= 0.0:
-            raise ValueError(
-                "the criterion must keep at least one active loss weight positive"
-            )
-        if self.use_direct:
-            if direct_temp <= 0.0:
-                raise ValueError("direct_temp must be positive")
-            # Stored normalized and in half precision: the only operation it feeds is
-            # a cosine, and at corpus scale this buffer is the largest thing the
-            # criterion owns (N x 2560).
-            normalized = F.normalize(
-                teacher_embeddings.float(), p=2, dim=-1, eps=self.eps_norm
-            ).half()
-            self.register_buffer("teacher_bank", normalized, persistent=False)
-            # One temperature for both sides of the ambient scale (same-temperature
-            # distillation, Hinton et al. 2015): the student softmax at scale 0 in
-            # forward() reuses this exact value.
-            self.direct_temp = float(direct_temp)
-        else:
-            self.teacher_bank = None
-            self.direct_temp = float(direct_temp)
+        if not bool(torch.isfinite(temps).all()) or bool((temps <= 0).any()):
+            raise ValueError("row_temps must be finite and positive")
 
-        # One hop, so there is no ladder: the graph group is a single scale whose
-        # target IS the transition row, and its temperature is that row's own
-        # bandwidth. r0_weight and r1_weight are independent group coefficients,
-        # applied directly without normalization. The defaults are 0.5/0.5. The
-        # multi-hop ladder this replaced derived
-        # tau_r = sqrt(r) * tau_1 and omega_r ~ 1/r from `diffusion_scales`.
+        self.cal_weight = float(cal_weight)
+        self.row_weight = float(row_weight)
+        self.cal_temp = float(cal_temp)
+        self.row_set = row_set
+        self.row_target = row_target
+        self.row_columns = row_columns
+        # Normalized once, in half precision: it only feeds cosines, and at corpus
+        # scale it is the largest buffer the criterion owns.
         self.register_buffer(
-            "scale_weights", torch.tensor([self.r1_weight], dtype=torch.float32)
+            "teacher_bank",
+            F.normalize(teacher_embeddings.float(), p=2, dim=-1, eps=EPS_NORM).half(),
+            persistent=False,
         )
         self.register_buffer(
-            "direct_weight", torch.tensor([self.r0_weight], dtype=torch.float32)
+            "row_neighbors", transition_neighbors.long(), persistent=False
         )
-        self.register_buffer(
-            "scale_temps", torch.full((1,), float(self.graph_temp), dtype=torch.float32)
-        )
-        # Whether `loss_excess` is an exact statement rather than an upper bound.
-        # With one graph scale the bound is tight unless per-row temperatures make
-        # the group's scales differ from each other.
-        self._excess_is_exact = bool(
-            self.relation_target in ("direct", "ambient_only") or row_temps is None
-        )
-
-    def _build_shared_pool(
-        self,
-        candidate_embeddings: torch.Tensor,
-        teacher_probs: torch.Tensor,
-        candidate_idx: torch.Tensor,
-        anchor_idx: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        batch_size, n_scales, candidate_size = teacher_probs.shape
-        flat_idx = candidate_idx.reshape(-1)
-        unique_idx, inverse = torch.unique(flat_idx, return_inverse=True)
-        pool_size = unique_idx.numel()
-
-        # One representative embedding per corpus index. Duplicates across anchors are
-        # the same text, so any occurrence is the same vector up to padding.
-        representative = torch.zeros(
-            pool_size, dtype=torch.long, device=candidate_embeddings.device
-        )
-        representative.scatter_(
-            0,
-            inverse,
-            torch.arange(
-                flat_idx.numel(), device=candidate_embeddings.device, dtype=torch.long
-            ),
-        )
-        pool_embeddings = candidate_embeddings.index_select(0, representative)
-
-        target = torch.zeros(
-            batch_size,
-            n_scales,
-            pool_size,
-            dtype=teacher_probs.dtype,
-            device=teacher_probs.device,
-        )
-        scatter_index = inverse.view(batch_size, 1, candidate_size).expand(
-            batch_size, n_scales, candidate_size
-        )
-        target.scatter_add_(2, scatter_index, teacher_probs)
-
-        # Counts rather than a bool scatter: one corpus node can occupy several
-        # columns of an anchor's draw, and a last-write-wins scatter would lose that.
-        occurrence_positions = inverse.view(batch_size, candidate_size)
-        own_counts = torch.zeros(
-            batch_size, pool_size, dtype=torch.int32, device=teacher_probs.device
-        )
-        own_counts.scatter_add_(
-            1,
-            occurrence_positions,
-            torch.ones_like(occurrence_positions, dtype=torch.int32),
-        )
-        own_mask = own_counts > 0
-
-        self_mask = unique_idx.view(1, -1) == anchor_idx.view(-1, 1)
-        return (
-            pool_embeddings,
-            target,
-            self_mask,
-            own_mask,
-            unique_idx,
-        )
-
-    @torch.no_grad()
-    def _teacher_cosine_logits(
-        self,
-        anchor_idx: torch.Tensor,
-        column_idx: torch.Tensor,
-        shared: bool,
-    ) -> torch.Tensor:
-        """cos(t_i, t_j) for every scored column, read off the cached bank."""
-        bank = self.teacher_bank
-        t_anchor = bank.index_select(0, anchor_idx).float()
-        if shared:
-            t_columns = bank.index_select(0, column_idx).float()
-            return t_anchor @ t_columns.t()
-        batch_size, candidate_size = column_idx.shape
-        t_columns = bank.index_select(0, column_idx.reshape(-1)).float()
-        t_columns = t_columns.view(batch_size, candidate_size, -1)
-        return torch.einsum("bd,bcd->bc", t_anchor, t_columns)
-
-    @torch.no_grad()
-    def _direct_target(
-        self,
-        anchor_idx: torch.Tensor,
-        column_idx: torch.Tensor,
-        exclusion_mask: torch.Tensor,
-        shared: bool,
-    ) -> torch.Tensor:
-        """Teacher similarity over every scored column, not just the graph pool.
-
-        This is the ambient scale r=0: dense over the whole shared pool, at the
-        single ambient temperature, and what calibrates similarity levels across
-        the batch.
-        """
-        logits = self._teacher_cosine_logits(anchor_idx, column_idx, shared)
-        logits = logits / self.direct_temp
-        logits = logits.masked_fill(exclusion_mask, float("-inf"))
-        return F.softmax(logits, dim=-1)
-
-    @torch.no_grad()
-    def _direct_relation_target(
-        self,
-        anchor_idx: torch.Tensor,
-        column_idx: torch.Tensor,
-        own_mask: torch.Tensor,
-        self_mask: torch.Tensor,
-        shared: bool,
-    ) -> torch.Tensor:
-        """Teacher cosine over *the anchor's own selected columns* (S3 control).
-
-        Shares its teacher cosines with `_direct_target` and differs in the two
-        things that define the arm: the column domain is restricted to the
-        anchor's own draw -- the same columns the diffusion scales see -- and the
-        temperature is the r=1 tie (the per-row graph bandwidth) rather than the
-        ambient one. So the only difference between this arm and the method is
-        whether the target over those columns is the composed multi-hop
-        transition rows or the teacher's raw similarity.
-        """
-        logits = self._teacher_cosine_logits(anchor_idx, column_idx, shared)
-        if self.row_temps is not None:
-            tau = self.row_temps.index_select(0, anchor_idx).view(-1, 1)
+        self.register_buffer("row_probs", transition_probs.float(), persistent=False)
+        self.register_buffer("row_temps", temps, persistent=False)
+        if row_inclusion is not None:
+            p = row_inclusion.detach().float().reshape(-1)
+            if p.numel() != n_items or bool((p <= 0).any()) or bool((p > 1).any()):
+                raise ValueError(
+                    "row_inclusion must hold one probability in (0, 1] per text"
+                )
+            self.register_buffer("row_weights", 1.0 / p, persistent=False)
         else:
-            tau = logits.new_full((1, 1), self.graph_temp)
-        logits = logits / tau
-        logits = logits.masked_fill(self_mask | ~own_mask, float("-inf"))
-        # A row with no available column would softmax to NaN. It cannot happen --
-        # every anchor owns its own draw -- but the loss would go non-finite three
-        # frames later and blame the student.
-        empty = (~(own_mask & ~self_mask)).all(dim=-1, keepdim=True)
-        probs = F.softmax(logits, dim=-1)
-        return torch.where(empty, torch.zeros_like(probs), probs)
-
-    @torch.no_grad()
-    def _random_row_columns(
-        self,
-        source_positions: torch.Tensor,
-        source_nodes: torch.Tensor,
-        column_idx: torch.Tensor,
-        allowed: torch.Tensor,
-        row_tau: torch.Tensor | float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stage 1.1b: each supervised row keeps its width and loses its columns.
-
-        Row j is scored over as many pool columns as the teacher exposed for it,
-        drawn uniformly from the pool (never j itself), against the teacher's
-        softmax at tau_j over those columns. On the real columns that softmax is
-        exactly the renormalized transition row, so the only thing this arm
-        changes is *which* columns row j is compared against.
-        """
-        rows, pool_size = allowed.shape
-        device = allowed.device
-        counts = allowed.sum(dim=1)
-        scores = torch.rand(rows, pool_size, device=device)
-        scores[torch.arange(rows, device=device), source_positions] = -1.0
-        kth = scores.sort(dim=1, descending=True).values.gather(
-            1, (counts - 1).clamp_min(0).view(-1, 1)
-        )
-        random_allowed = scores >= kth
-        logits = (
-            self._teacher_cosine_logits(source_nodes, column_idx, shared=True) / row_tau
-        )
-        logits = logits.masked_fill(~random_allowed, float("-inf"))
-        return random_allowed, F.softmax(logits, dim=-1)
-
-    def _compute_row_loss(
-        self,
-        pool_norm: torch.Tensor,
-        column_idx: torch.Tensor,
-        selected_columns: torch.Tensor,
-        anchor_columns: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Match transition rows at the graph-selected non-anchor pool columns.
-
-        ``selected_columns`` marks the columns carrying diffusion mass for some
-        anchor -- the teacher-chosen part of the draw, excluding hard and uniform
-        negatives, which were chosen for reasons that say nothing about their own
-        neighbourhood. ``anchor_columns`` marks the batch anchors, removed because
-        L_rel already supervises their transition row as its r=1 target.
-        """
-        zero = pool_norm.new_zeros(())
-        empty_metrics = {
-            "row_teacher_entropy": zero,
-            "row_eff_denom": zero,
-            "row_count": zero,
-            "row_valid_ratio": zero,
-            "row_exposed_mass": zero,
-            "row_kl_p50": zero,
-            "row_kl_p90": zero,
-            "row_exposed_mass_p10": zero,
-            "row_exposed_mass_p90": zero,
-        }
-        if self.row_neighbors is None or self.row_probs is None:
-            return zero, empty_metrics
-
-        pool_size = int(pool_norm.size(0))
-        source_positions = (selected_columns & ~anchor_columns).nonzero(as_tuple=True)[
-            0
-        ]
-        eligible = source_positions.numel()
-        if eligible == 0:
-            return zero, empty_metrics
-        source_nodes = column_idx.index_select(0, source_positions)
-
-        neighbors = self.row_neighbors.index_select(0, source_nodes).long()
-        teacher_probs = self.row_probs.index_select(0, source_nodes).float()
-        flat_neighbors = neighbors.reshape(-1)
-        neighbor_positions = torch.searchsorted(
-            column_idx, flat_neighbors.clamp_min(0)
-        ).clamp_max(pool_size - 1)
-        present = (flat_neighbors >= 0) & (
-            column_idx[neighbor_positions] == flat_neighbors
-        )
-        neighbor_positions = neighbor_positions.view_as(neighbors)
-        keep = present.view_as(neighbors) & (teacher_probs > 0)
-        keep &= neighbor_positions != source_positions.unsqueeze(1)
-
-        target = torch.zeros(source_nodes.numel(), pool_size, device=pool_norm.device)
-        target.scatter_add_(
-            1,
-            neighbor_positions,
-            torch.where(keep, teacher_probs, torch.zeros_like(teacher_probs)),
-        )
-        # m_B(j) = P^T_j(Omega_j): how much of row j's teacher transition mass this
-        # pool actually exposes. Taken before the renormalization below, which is
-        # exactly the step that destroys it -- afterwards every row sums to 1 whether
-        # it was built from 85% of the teacher's mass or 8%.
-        exposed_mass = target.sum(dim=1)
-        allowed = target > 0
-        live_columns = allowed.sum(dim=1)
-        usable = live_columns >= 2
-        if not bool(usable.any()):
-            return zero, empty_metrics
-
-        target = target[usable]
-        allowed = allowed[usable]
-        source_positions = source_positions[usable]
-        source_nodes = source_nodes[usable]
-        exposed_mass = exposed_mass[usable]
-        target = target / target.sum(dim=1, keepdim=True).clamp_min(1e-12)
-
-        if self.row_temps is not None:
-            row_tau = self.row_temps.index_select(0, source_nodes).view(-1, 1)
-        else:
-            row_tau = self.graph_temp
-        if self.row_centers == "random":
-            allowed, target = self._random_row_columns(
-                source_positions, source_nodes, column_idx, allowed, row_tau
-            )
-        if self.relation_target == "uniform":
-            target = allowed.to(target.dtype) / allowed.sum(dim=1, keepdim=True).to(
-                target.dtype
-            )
-        logits = (pool_norm.index_select(0, source_positions) @ pool_norm.t()) / row_tau
-        logits = logits.masked_fill(~allowed, float("-inf"))
-        log_probs = F.log_softmax(logits, dim=-1)
-        log_target = torch.where(
-            target > 0, target.clamp_min(1e-12).log(), torch.zeros_like(target)
-        )
-        row_kl = torch.where(
-            target > 0,
-            target * (log_target - log_probs),
-            torch.zeros_like(target),
-        ).sum(dim=1)
-        # nu is uniform, so the row measure is the plain mean over usable rows.
-        loss_row = row_kl.mean()
-
-        row_entropy = -(target * log_target).sum(dim=1)
-        metrics = {
-            "row_teacher_entropy": row_entropy.mean(),
-            "row_eff_denom": live_columns[usable].float().mean(),
-            "row_count": usable.sum().float(),
-            # Rows that survived the |Omega| >= 2 filter, over the eligible ones.
-            "row_valid_ratio": usable.sum().float() / eligible,
-            # Mean of m_B(j) = P^T_j(Omega_j): the fraction of each row's true
-            # transition mass the pool exposes, ~0.44 on the production graph. The
-            # restricted target renormalizes over that fraction, so this is the size
-            # of the truncation L_row accepts -- keep it visible.
-            "row_exposed_mass": exposed_mass.mean(),
-            # Attribution, not just a mean. A batch mean cannot distinguish "every
-            # row is moderately wrong" from "a handful of rows carry the term", and
-            # those call for different fixes. Quantiles are taken per batch and
-            # averaged over the epoch by the caller, which is not the epoch-level
-            # quantile but tracks it closely enough to read a trend.
-            "row_kl_p50": row_kl.detach().quantile(0.50),
-            "row_kl_p90": row_kl.detach().quantile(0.90),
-            "row_exposed_mass_p10": exposed_mass.quantile(0.10),
-            "row_exposed_mass_p90": exposed_mass.quantile(0.90),
-        }
-        return loss_row, metrics
-
-    @torch.no_grad()
-    def _ambient_diffusion_audit(
-        self,
-        target: torch.Tensor,
-        self_mask: torch.Tensor,
-        own_mask: torch.Tensor,
-        direct_active: bool,
-    ) -> list[tuple[str, torch.Tensor]]:
-        """How much the ambient and diffusion scales still argue inside the own draw.
-
-        The domain split silenced their disagreement on *other anchors'* columns,
-        but both scales still score the anchor's own candidates, and there the
-        contested ground is the zero-diffusion-target columns: columns carrying high
-        teacher cosine but no graph mass, so ambient pulls up what the r>=1 softmax
-        normalization pushes down.
-
-        At the method's settings this set is empty by construction -- the draw is
-        the anchor's whole transition row, every column of which carries mass -- so
-        `amb_mass_on_zero_diff` should read ~0 and a non-zero value means an arm is
-        running (negatives drawn, a truncated row, or a mutual filter). It stays
-        because that is exactly when the number is worth having.
-
-        This is the same loss-floor accounting that motivated the domain split (the
-        0.42-nat JS on the shared pool), scoped to what remains. Read it as: if
-        `amb_diff_js_own` stays near zero, the residual tension is noise; if it is a
-        large share of the loss floor, the diffusion domain is the next thing to
-        restrict. Diagnostics only -- nothing here touches the objective.
-        """
-        zero = target.new_zeros(())
-        empty = [
-            ("amb_mass_own", zero),
-            ("amb_mass_on_zero_diff", zero),
-            ("amb_diff_js_own", zero),
-        ]
-        if not direct_active:
-            return empty
-        # `ambient_only` leaves the ambient profile alone in the stack. There is no
-        # diffusion scale to disagree with it, so every quantity here is zero by
-        # definition -- and target[:, 1, :] would be an index error, not a zero.
-        if target.size(1) < 2:
-            return empty
-
-        # `target` already carries the ambient profile at index 0, so index 1 is the
-        # r=1 transition target and 1: is the whole diffusion group.
-        ambient = target[:, 0, :]
-        own_valid = own_mask & ~self_mask
-        amb_own = ambient * own_valid
-        amb_mass_own = amb_own.sum(dim=-1)
-
-        diffusion_total = target[:, 1:, :].sum(dim=1)
-        zero_diff = own_valid & (diffusion_total <= 0)
-        amb_mass_zero = (ambient * zero_diff).sum(dim=-1)
-
-        neighbor = target[:, 1, :]
-        usable = (amb_mass_own > 1e-12) & (neighbor.sum(dim=-1) > 0)
-
-        def _entropy(p: torch.Tensor) -> torch.Tensor:
-            logp = torch.where(p > 0, p.clamp_min(1e-12).log(), torch.zeros_like(p))
-            return -(p * logp).sum(dim=-1)
-
-        # Computed over every row and then masked, rather than indexed by
-        # `usable` behind a `bool(usable.any())`. Boolean indexing needs the
-        # mask's contents on the host, so the old form paid a device sync here
-        # every step. On the usable rows the arithmetic is unchanged -- the
-        # clamped denominator only ever binds on rows this mean discards -- and
-        # with no usable row the masked mean is 0, exactly as the old branch.
-        a_own = amb_own / amb_own.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        mixture = 0.5 * (a_own + neighbor)
-        js = (
-            _entropy(mixture) - 0.5 * _entropy(a_own) - 0.5 * _entropy(neighbor)
-        ).clamp_min(0.0)
-        keep = usable.to(js.dtype)
-        js_mean = (js * keep).sum() / keep.sum().clamp_min(1.0)
-
-        return [
-            ("amb_mass_own", amb_mass_own.mean()),
-            ("amb_mass_on_zero_diff", amb_mass_zero.mean()),
-            ("amb_diff_js_own", js_mean),
-        ]
+            self.row_weights = None
 
     def forward(
         self,
-        anchor_embeddings: torch.Tensor,
-        candidate_embeddings: torch.Tensor,
-        teacher_probs: torch.Tensor,
-        candidate_idx: torch.Tensor | None = None,
-        anchor_idx: torch.Tensor | None = None,
+        pool_embeddings: torch.Tensor,
+        pool_idx: torch.Tensor,
+        anchor_pos: torch.Tensor,
+        cal_exclude: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        # Checked lazily. Verifying the inputs eagerly cost one host sync per
-        # step to answer a question the output check below already answers --
-        # a non-finite input can only produce a non-finite loss. Kept here by
-        # name so the failure path can still blame the encoder rather than the
-        # objective, which is the only reason the input check existed.
-        inputs = (
-            ("anchor_embeddings", anchor_embeddings),
-            ("candidate_embeddings", candidate_embeddings),
-            ("teacher_probs", teacher_probs),
-        )
+        pool_norm = F.normalize(pool_embeddings.float(), p=2, dim=-1, eps=EPS_NORM)
+        zero = pool_norm.new_zeros(())
+        entries: list[tuple[str, torch.Tensor]] = [
+            ("pool_size", zero + pool_idx.numel()),
+        ]
 
-        batch_size = anchor_embeddings.size(0)
-        candidate_size = teacher_probs.size(-1)
-        n_scales = teacher_probs.size(1)
-
-        teacher_probs = teacher_probs.clamp_min(0.0)
-        teacher_probs = teacher_probs / teacher_probs.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-12)
-
-        anchor_norm = F.normalize(anchor_embeddings, p=2, dim=-1, eps=self.eps_norm)
-        # A free view for the [B*C, D] the step passes; also accepts [B, C, D].
-        candidate_embeddings = candidate_embeddings.reshape(
-            batch_size * candidate_size, -1
-        )
-
-        share = candidate_idx is not None and anchor_idx is not None
-        if share:
-            (
-                pool_embeddings,
-                target,
-                self_mask,
-                own_mask,
-                column_idx,
-            ) = self._build_shared_pool(
-                candidate_embeddings,
-                teacher_probs,
-                candidate_idx,
-                anchor_idx,
+        loss_cal = zero
+        if self.cal_weight > 0:
+            loss_cal, cal_entries = self._calibration_loss(
+                pool_norm, pool_idx, anchor_pos, cal_exclude
             )
-            pool_norm = F.normalize(pool_embeddings, p=2, dim=-1, eps=self.eps_norm)
-            similarity = anchor_norm @ pool_norm.t()
-            target = target.masked_fill(self_mask.unsqueeze(1), 0.0)
-            target = target / target.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            # The row set for L_row is the support draw, read before the ambient
-            # scale is concatenated. Transition targets mark it by positive graph
-            # mass. Direct targets are constructed below from the teacher bank, so
-            # their incoming tensor may be all-zero (batch-local/corpus-uniform);
-            # in that case the ownership mask is the support definition. This is
-            # what lets every comparison arm run the same complete objective.
-            if self.relation_target == "direct":
-                selected_columns = own_mask.any(dim=0)
-            else:
-                selected_columns = (target.sum(dim=1) > 0).any(dim=0)
-            anchor_columns = self_mask.any(dim=0)
-        else:
-            # Only reachable without corpus indices, which the production path
-            # always supplies. Building the [B, C, D] normalization and its
-            # einsum unconditionally meant computing it -- and keeping it in the
-            # autograd graph -- on every step of every real run to discard it.
-            candidate_norm_own = F.normalize(
-                candidate_embeddings.reshape(batch_size, candidate_size, -1),
-                p=2,
-                dim=-1,
-                eps=self.eps_norm,
-            )
-            similarity = torch.einsum("bd,bcd->bc", anchor_norm, candidate_norm_own)
-            target = teacher_probs
-            column_idx = candidate_idx
-            # Without sharing every column already belongs to this anchor, so the
-            # two domains coincide. The anchor is still masked explicitly rather than
-            # assumed absent: it is excluded upstream by construction, but nothing
-            # here enforces it, and an anchor scored against itself lands at cos = 1
-            # with the sharpest temperature behind it.
-            own_mask = torch.ones_like(similarity, dtype=torch.bool)
-            if column_idx is not None and anchor_idx is not None:
-                self_mask = column_idx == anchor_idx.view(-1, 1)
-            else:
-                self_mask = torch.zeros_like(similarity, dtype=torch.bool)
-        if n_scales != 1:
-            raise ValueError(
-                "teacher_probs must carry exactly one target scale; multi-hop "
-                f"diffusion has been removed, got n_scales={n_scales}"
-            )
-        weights = self.scale_weights
-        temps = self.scale_temps
+            entries += cal_entries
+        loss_row = zero
+        if self.row_weight > 0:
+            loss_row, row_entries = self._row_loss(pool_norm, pool_idx, anchor_pos)
+            entries += row_entries
 
-        if self.relation_target == "ambient_only":
-            # Drop the graph group. The ambient scale prepended below retains its
-            # configured r0_weight and is the entire relational objective.
-            target = target[:, :0, :]
-            weights = weights[:0]
-            temps = temps[:0]
-            n_scales = 0
-        elif self.relation_target == "direct":
-            if anchor_idx is None or column_idx is None:
-                raise ValueError(
-                    "relation_target='direct' needs corpus indices for both the "
-                    "anchors and the scored columns"
-                )
-            # `selected_columns` was already read off the diffusion target above, so
-            # L_row keeps supervising exactly the rows it does in the full method:
-            # this arm changes the target, not the row set.
-            target = (
-                self._direct_relation_target(
-                    anchor_idx, column_idx, own_mask, self_mask, share
-                )
-                .unsqueeze(1)
-                .to(target.dtype)
-            )
-            # One scale carrying the diffusion group's whole weight, so the
-            # graph-group / ambient balance is identical to the full method.
-            weights = weights.sum(dim=0, keepdim=True)
-            temps = temps[:1]
-            n_scales = 1
-        elif self.relation_target == "uniform":
-            # Same columns, same tau_i, same weight as the transition target; only
-            # the values change, to equal mass on every retrieved neighbour in the
-            # anchor's draw. If this ties the method, how similar the teacher says
-            # each neighbour is carries nothing beyond which texts it retrieved.
-            support = target > 0
-            target = support.to(target.dtype) / support.sum(
-                dim=-1, keepdim=True
-            ).clamp_min(1).to(target.dtype)
-
-        # Scale r=0: the teacher's own similarity over every scored column. Without
-        # it, every column outside the anchor's diffusion pool carries target 0 and
-        # is pushed toward maximal dissimilarity regardless of what the teacher says.
-        # A local, not an attribute. Setting it on `self` inside forward() made
-        # the module carry per-batch state, forced every reader to defend with
-        # `getattr(self, ..., False)`, and would have crossed batches under any
-        # concurrent use.
-        direct_active = (
-            self.calibration_mode != "none"
-            and self.use_direct
-            and anchor_idx is not None
-            and column_idx is not None
-        )
-        if self.relation_target == "ambient_only" and not direct_active:
-            # The graph group has already been dropped, so without the ambient
-            # scale there is no scale left at all and the stack below would be
-            # empty. Say that, rather than fail on a zero-length torch.stack.
-            raise ValueError(
-                "relation_target='ambient_only' is the ambient scale and nothing "
-                "else; it needs the teacher bank and corpus indices for both the "
-                "anchors and the scored columns"
-            )
-        if direct_active:
-            # Calibration scores the whole shared pool minus the anchor itself.
-            direct_mask = self_mask
-            direct = self._direct_target(anchor_idx, column_idx, direct_mask, share)
-            target = torch.cat([direct.unsqueeze(1).to(target.dtype), target], dim=1)
-            weights = torch.cat([self.direct_weight.to(weights.dtype), weights])
-            # Same temperature as the teacher side of the direct target: the tie
-            # that makes the target attainable rather than a rescaling exercise.
-            temps = torch.cat([temps.new_full((1,), self.direct_temp), temps])
-            n_scales += 1
-        else:
-            direct_mask = self_mask
-        log_target = torch.where(
-            target > 0, target.clamp_min(1e-12).log(), torch.zeros_like(target)
-        )
-        target_entropy = -(target * log_target).sum(dim=-1)
-
-        # Column domain per scale. The diffusion targets are the graph's mass
-        # renormalized over *this anchor's* draw, so outside that draw their zeros are
-        # an artefact of who else happened to be in the batch, not a teacher judgement.
-        # Softmaxing them over the whole shared pool turns those artefacts into a
-        # gradient that pushes ~900 of ~965 cosines down, and the ambient scale then
-        # spends its weight pulling the same columns back up. Measured on the 13.5k
-        # run, the two halves disagreed by 0.42 nats -- 61% of the maximum possible --
-        # and that disagreement was 94% of the irreducible loss floor, which is why
-        # the objective saturated after one epoch.
-        #
-        # Restricting the diffusion softmax to the anchor's own columns makes the
-        # gradient on every other column exactly zero, so the diffusion scales rank
-        # within the neighbourhood and the ambient scale compares against the full
-        # shared pool. Complementary instead of opposed.
-        diffusion_mask = self_mask | ~own_mask
-
-        # The sharpest diffusion scale is the one whose target IS the anchor's
-        # transition row, so it is the scale the temperature tie binds. With
-        # entropic affinities that temperature is per anchor, not global.
-        offset = 1 if direct_active else 0
-        row_tau = None
-        if self.row_temps is not None and anchor_idx is not None:
-            row_tau = self.row_temps.index_select(0, anchor_idx).view(-1, 1)
-        kl_per_scale = []
-        log_probs_per_scale = []
-        for scale_idx in range(n_scales):
-            is_direct = direct_active and scale_idx == 0
-            if row_tau is not None and not is_direct:
-                logits = similarity / row_tau
-            else:
-                logits = similarity / temps[scale_idx]
-            logits = logits.masked_fill(
-                direct_mask if is_direct else diffusion_mask, float("-inf")
-            )
-            log_probs = F.log_softmax(logits, dim=-1)
-            log_probs_per_scale.append(log_probs)
-            scale_target = target[:, scale_idx, :]
-            contribution = torch.where(
-                scale_target > 0,
-                scale_target * (log_target[:, scale_idx, :] - log_probs),
-                torch.zeros_like(scale_target),
-            )
-            kl_per_scale.append(contribution.sum(dim=-1))
-        kl_per_scale = torch.stack(kl_per_scale, dim=1)
-        # Semantic decomposition of the relational stack. Scale r=0 is the
-        # ambient teacher-similarity profile, r=1 is the direct transition row,
-        # and r>1 are the genuinely multi-hop diffusion targets. The grouped
-        # multi-hop diagnostics, if ever restored, are normalized within that
-        # subgroup; ``loss_rel`` keeps the configured direct coefficients, so
-        # this does not alter the optimized objective.
-        loss_rel = (kl_per_scale * weights.view(1, -1)).sum(dim=-1).mean()
-        zero = loss_rel.new_zeros(())
-        loss_amb = kl_per_scale[:, 0].mean() if offset else zero
-
-        graph_kl = kl_per_scale[:, offset:]
-        loss_nbr = graph_kl[:, 0].mean() if graph_kl.size(1) else zero
-        multi_hop_kl = graph_kl[:, 1:]
-        multi_hop_weights = weights[offset + 1 :]
-        if multi_hop_kl.size(1):
-            normalized_multi_hop_weights = multi_hop_weights / (
-                multi_hop_weights.sum().clamp_min(1e-12)
-            )
-            loss_diff = (
-                (multi_hop_kl * normalized_multi_hop_weights.view(1, -1))
-                .sum(dim=-1)
-                .mean()
-            )
-        else:
-            loss_diff = zero
-
-        loss_row = anchor_embeddings.new_zeros(())
-        row_metrics: dict[str, torch.Tensor] = {}
-        if self.use_row_loss:
-            if share:
-                loss_row, row_metrics = self._compute_row_loss(
-                    pool_norm=pool_norm,
-                    column_idx=column_idx,
-                    selected_columns=selected_columns,
-                    anchor_columns=anchor_columns,
-                )
-            elif not self._warned_row_needs_sharing:
-                self._warned_row_needs_sharing = True
-                print(
-                    "GGPKD: L_row requires corpus indices for in-batch sharing; "
-                    "term disabled."
-                )
-
-        total_loss = loss_rel + self.row_weight * loss_row
+        cal_term = self.cal_weight * loss_cal
+        row_term = self.row_weight * loss_row
+        total = cal_term + row_term
         try:
-            _assert_finite_tensors(
-                (
-                    ("loss_rel", loss_rel),
-                    ("loss_amb", loss_amb),
-                    ("loss_nbr", loss_nbr),
-                    ("loss_diff", loss_diff),
-                    ("loss_row", loss_row),
-                    ("total_loss", total_loss),
-                )
-            )
+            _assert_finite((("loss_cal", loss_cal), ("loss_row", loss_row)))
         except RuntimeError:
-            # A non-finite loss almost always arrives from upstream. Name that
-            # tensor rather than the loss term that merely carried it -- which is
-            # the whole reason the inputs were checked, and now the only time
-            # checking them costs anything.
-            _assert_finite_tensors(inputs)
+            # A non-finite loss almost always comes from the encoder; name it.
+            _assert_finite((("pool_embeddings", pool_embeddings),))
             raise
 
-        metrics = self._diagnostics(
-            total_loss=total_loss,
-            loss_rel=loss_rel,
-            loss_amb=loss_amb,
-            loss_nbr=loss_nbr,
-            loss_diff=loss_diff,
-            loss_row=loss_row,
-            row_metrics=row_metrics,
-            kl_per_scale=kl_per_scale,
-            log_probs_per_scale=log_probs_per_scale,
-            target=target,
-            target_entropy=target_entropy,
-            weights=weights,
-            self_mask=self_mask,
-            direct_mask=direct_mask,
-            diffusion_mask=diffusion_mask,
-            temps=temps,
-            direct_active=direct_active,
-            extra_entries=self._ambient_diffusion_audit(
-                target, self_mask, own_mask, direct_active
-            ),
-        )
-        return total_loss, metrics
-
-    @torch.no_grad()
-    def _diagnostics(
-        self,
-        total_loss: torch.Tensor,
-        loss_rel: torch.Tensor,
-        loss_amb: torch.Tensor,
-        loss_nbr: torch.Tensor,
-        loss_diff: torch.Tensor,
-        loss_row: torch.Tensor,
-        row_metrics: dict[str, torch.Tensor],
-        kl_per_scale: torch.Tensor,
-        log_probs_per_scale: list[torch.Tensor],
-        target: torch.Tensor,
-        target_entropy: torch.Tensor,
-        weights: torch.Tensor,
-        self_mask: torch.Tensor,
-        direct_mask: torch.Tensor,
-        diffusion_mask: torch.Tensor,
-        temps: torch.Tensor,
-        direct_active: bool,
-        extra_entries: list[tuple[str, torch.Tensor]] = (),
-    ) -> dict[str, float]:
-        """Loss value alone cannot distinguish "learned the geometry" from "went uniform".
-
-        It also cannot distinguish "still learning" from "sitting on the irreducible
-        floor", which is why the Jensen-Shannon term and the excess above it are
-        logged next to the raw loss.
-
-        Unsuffixed metrics describe the *neighbor* scale, over the anchor's
-        own candidate columns. An earlier version indexed scale 0, which stopped being
-        that scale the moment the ambient target was prepended to the stack: the curves
-        kept their names and silently started reporting the ambient scale at a
-        different temperature over a 15x larger column set. The ambient scale now
-        reports under its own `*_amb` names.
-        """
-        offset = 1 if direct_active else 0
-        k = min(self.diag_topk, target.size(-1))
-
-        def _distribution_stats(
-            log_probs: torch.Tensor,
-            scale_target: torch.Tensor,
-            mask: torch.Tensor,
-            suffix: str = "",
-        ) -> list[tuple[str, torch.Tensor]]:
-            """The six per-scale distribution stats, already carrying their names.
-
-            Returning bare tuples meant every caller had to re-list the names in the
-            same order somewhere else; the two lists then had to be kept aligned by
-            hand across three append sites, and a mismatch bound every metric to the
-            wrong number in silence rather than raising.
-            """
-            probs_student = log_probs.exp()
-            student_entropy = -(
-                probs_student
-                * torch.where(probs_student > 0, log_probs, torch.zeros_like(log_probs))
-            ).sum(dim=-1)
-            # Two columns is the smallest set on which a softmax has any freedom, so
-            # it is the smallest denominator for which the ratio means anything.
-            n_columns = (~mask).sum(dim=-1).float()
-            uniform_entropy = n_columns.clamp_min(2.0).log()
-            teacher_top = scale_target.topk(k, dim=-1).indices
-            return [
-                (f"student_entropy{suffix}", student_entropy.mean()),
-                (
-                    f"student_entropy_ratio{suffix}",
-                    (student_entropy / uniform_entropy).mean(),
-                ),
-                (f"student_top1{suffix}", probs_student.max(dim=-1).values.mean()),
-                (f"target_top1{suffix}", scale_target.max(dim=-1).values.mean()),
-                (
-                    f"student_mass_on_teacher_top{k}{suffix}",
-                    probs_student.gather(-1, teacher_top).sum(dim=-1).mean(),
-                ),
-                (
-                    "candidates_per_anchor" if not suffix else "pool_columns_amb",
-                    n_columns.mean(),
-                ),
-            ]
-
-        # Irreducible floor of the graph-scale group (neighbor plus diffusion):
-        # sum_r w_r KL(p_r||q) >= W * JS_v(p_r), with W the group's total weight
-        # and v_r = w_r/W. The ambient scale
-        # is excluded: it no longer shares a column domain with the diffusion scales,
-        # so a single q cannot be substituted into both, and on its own its floor is
-        # zero. Folding it in was what made js_floor read 0.45 nats while the diffusion
-        # scales genuinely disagreed by 0.05 -- the gap was the two halves of the
-        # objective fighting, reported as if it were a property of the targets.
-        graph_target = target[:, offset:, :]
-        graph_weights = weights[offset:].view(1, -1)
-        # Scales with no mass on this anchor's draw contribute KL 0 and must not dilute
-        # the mixture either; their weight is dropped for that anchor only.
-        has_mass = graph_target.sum(dim=-1) > 0
-        w_eff = graph_weights * has_mass.to(graph_weights.dtype)
-        w_total = w_eff.sum(dim=-1, keepdim=True)
-        w_norm = w_eff / w_total.clamp_min(1e-12)
-
-        mixture = (graph_target * w_norm.unsqueeze(-1)).sum(dim=1)
-        log_mixture = torch.where(
-            mixture > 0, mixture.clamp_min(1e-12).log(), torch.zeros_like(mixture)
-        )
-        mixture_entropy = -(mixture * log_mixture).sum(dim=-1)
-        group_entropy = (target_entropy[:, offset:] * w_norm).sum(dim=-1)
-        js_floor = w_total.squeeze(-1) * (mixture_entropy - group_entropy).clamp_min(
-            0.0
-        )
-
-        # Full-stack weighted entropy: loss_rel = CE - H holds over every scale that
-        # is actually in the loss, ambient included.
-        weighted_entropy = (target_entropy * weights.view(1, -1)).sum(dim=-1)
-        row_zero = loss_row.new_zeros(())
-        effective_r0_weight = weights[0] if offset else row_zero
-        effective_r1_weight = weights[offset] if weights.numel() > offset else row_zero
-
-        # Per-anchor L_rel, before it is averaged away. `loss_rel` alone cannot say
-        # whether the objective is uniformly hard or dominated by a few anchors --
-        # and the graph build already warns that a handful sit in tiny components
-        # with a near one-hot r=1 target, which is exactly the shape that would show
-        # up here as a heavy tail.
-        per_anchor_rel = (kl_per_scale * weights.view(1, -1)).sum(dim=-1).detach()
-
-        # Do the diffusion scales say anything the sharpest one does not? The
-        # targets are matched at tau_r = sqrt(r) * tau_1, so the *student*
-        # distributions should differ across r; if this sits near zero the ladder is
-        # decorative and `diffusion_scales=(1,)` is the honest configuration. Mean
-        # symmetric KL between adjacent graph scales, over their shared column
-        # domain.
-        graph_log_probs = log_probs_per_scale[offset:]
-        if len(graph_log_probs) > 1:
-            divergences = []
-            for lower, upper in zip(graph_log_probs, graph_log_probs[1:]):
-                # Masked columns are -inf on both sides, and -inf minus -inf is
-                # NaN; every graph scale shares one column domain, so restricting
-                # to the finite entries is exact rather than an approximation.
-                live = torch.isfinite(lower) & torch.isfinite(upper)
-                p, q = lower.exp(), upper.exp()
-                term = torch.where(live, (p - q) * (lower - upper), torch.zeros_like(p))
-                divergences.append(term.sum(dim=-1).mean())
-            scale_divergence = torch.stack(divergences).mean().detach()
-        else:
-            scale_divergence = loss_rel.new_zeros(())
-
-        # One ordered (name, tensor) list rather than two lists that must be kept
-        # index-aligned by hand. The single device sync below is unchanged -- it is
-        # the reason this function batches its scalars at all -- but a name can no
-        # longer drift away from the value it labels.
-        entries: list[tuple[str, torch.Tensor]] = [
-            ("loss_total", total_loss.detach()),
-            ("loss_rel", loss_rel.detach()),
-            # `loss_cal` is the paper-facing name. Keep `loss_amb` as an exact
-            # alias so old result exporters and ablation tables remain readable.
-            ("loss_cal", loss_amb.detach()),
-            ("loss_amb", loss_amb.detach()),
-            ("loss_nbr", loss_nbr.detach()),
-            ("r0_weight_effective", effective_r0_weight.detach()),
-            ("r1_weight_effective", effective_r1_weight.detach()),
-            ("loss_r0_weighted", (effective_r0_weight * loss_amb).detach()),
-            ("loss_r1_weighted", (effective_r1_weight * loss_nbr).detach()),
-            ("loss_diff", loss_diff.detach()),
-            ("loss_row", loss_row.detach()),
-            ("loss_row_weighted", (self.row_weight * loss_row).detach()),
-            ("row_teacher_entropy", row_metrics.get("row_teacher_entropy", row_zero)),
-            ("row_eff_denom", row_metrics.get("row_eff_denom", row_zero)),
-            ("row_count", row_metrics.get("row_count", row_zero)),
-            ("row_valid_ratio", row_metrics.get("row_valid_ratio", row_zero)),
-            ("row_exposed_mass", row_metrics.get("row_exposed_mass", row_zero)),
-            ("row_kl_p50", row_metrics.get("row_kl_p50", row_zero)),
-            ("row_kl_p90", row_metrics.get("row_kl_p90", row_zero)),
-            (
-                "row_exposed_mass_p10",
-                row_metrics.get("row_exposed_mass_p10", row_zero),
-            ),
-            (
-                "row_exposed_mass_p90",
-                row_metrics.get("row_exposed_mass_p90", row_zero),
-            ),
-            ("loss_rel_p50", per_anchor_rel.quantile(0.50)),
-            ("loss_rel_p90", per_anchor_rel.quantile(0.90)),
-            ("loss_rel_max", per_anchor_rel.max()),
-            ("scale_divergence", scale_divergence),
-            ("js_floor", js_floor.mean()),
-            ("loss_excess", (loss_rel - js_floor.mean()).detach()),
-            ("loss_cross_entropy", (loss_rel + weighted_entropy.mean()).detach()),
-            ("target_entropy", weighted_entropy.mean()),
-            # `target_entropy` above is the whole weighted stack, because that is what
-            # loss_cross_entropy needs. It is therefore the one metric here that is not
-            # scoped to the sharpest diffusion scale, and comparing it against
-            # student_entropy compares two different column domains. This is the
-            # teacher entropy that student_entropy is actually the counterpart of.
+        entries = [
+            ("loss_total", total),
+            ("loss_cal", loss_cal),
+            ("loss_row", loss_row),
+            ("loss_cal_weighted", cal_term),
+            ("loss_row_weighted", row_term),
+            ("row_share", row_term / total.clamp_min(1e-12)),
+            *entries,
         ]
-        # The unsuffixed distribution stats describe the *neighbor* scale. Under
-        # `relation_target='ambient_only'` there is no such scale -- the stack is
-        # the ambient profile and nothing else -- so these are omitted rather than
-        # aimed at index `offset`, which is then past the end of the stack. The
-        # `*_amb` block below is that arm's whole report.
-        if kl_per_scale.size(1) > offset:
-            entries.append(("teacher_entropy_scale", target_entropy[:, offset].mean()))
-            entries.extend(
-                _distribution_stats(
-                    log_probs_per_scale[offset], target[:, offset, :], diffusion_mask
-                )
-            )
-        if offset:
-            entries.append(("teacher_entropy_amb", target_entropy[:, 0].mean()))
-            entries.append(
-                (
-                    "calibration_columns",
-                    (~direct_mask).sum(dim=-1).float().mean(),
-                )
-            )
-            entries.extend(
-                _distribution_stats(
-                    log_probs_per_scale[0],
-                    target[:, 0, :],
-                    direct_mask,
-                    suffix="_amb",
-                )
-            )
-
-        # Per-scale KLs carry positional names, so they are labelled here and joined
-        # to the same stack -- still one sync for everything logged.
-        per_scale_names = []
-        if offset:
-            per_scale_names.append("kl_amb")
-        for _ in range(kl_per_scale.size(1) - offset):
-            per_scale_names.append("kl_nbr")
-        entries.extend(zip(per_scale_names, kl_per_scale.mean(dim=0).detach()))
-        # The ambient-vs-diffusion audit rides the same stack. It used to run its
-        # own `.cpu().tolist()`, which is a second device sync for three scalars.
-        entries.extend(extra_entries)
-
+        # One device sync for every logged scalar.
         values = torch.stack(
             [value.detach().float().reshape(()) for _, value in entries]
-        ).tolist()
-        metrics = {name: value for (name, _), value in zip(entries, values)}
-        # js_floor bounds the graph-scale group (neighbor plus diffusion), and only
-        # under a tied student temperature. With distinct tau_r the true minimum is
-        # lower, so loss_excess is an upper bound on what is left to learn -- it
-        # reaching 0 means the objective is spent, but it can also go negative.
-        # Computed once in __init__ rather than per step: it depends only on
-        # row_temps and the derived ladder, both fixed for the run, and the
-        # `torch.allclose` it used to run here forced a second device sync right
-        # after the batched one above.
-        metrics["excess_is_exact"] = float(self._excess_is_exact)
-        return metrics
+        )
+        return total, dict(zip((name for name, _ in entries), values.tolist()))
+
+    def _calibration_loss(
+        self,
+        pool_norm: torch.Tensor,
+        pool_idx: torch.Tensor,
+        anchor_pos: torch.Tensor,
+        cal_exclude: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, list[tuple[str, torch.Tensor]]]:
+        student = pool_norm.index_select(0, anchor_pos) @ pool_norm.t() / self.cal_temp
+        with torch.no_grad():
+            teacher_pool = self.teacher_bank.index_select(0, pool_idx).float()
+            teacher = (
+                teacher_pool.index_select(0, anchor_pos)
+                @ teacher_pool.t()
+                / self.cal_temp
+            )
+            mask = torch.zeros_like(teacher, dtype=torch.bool)
+            mask[torch.arange(anchor_pos.numel(), device=mask.device), anchor_pos] = (
+                True
+            )
+            if cal_exclude is not None:
+                mask |= cal_exclude
+            target = F.softmax(teacher.masked_fill(mask, float("-inf")), dim=-1)
+        log_q = F.log_softmax(student.masked_fill(mask, float("-inf")), dim=-1)
+        loss = _kl_rows(target, log_q).mean()
+        return loss, [
+            ("cal_columns", (~mask).sum(-1).float().mean()),
+            ("cal_teacher_entropy", _entropy(target).mean()),
+            ("cal_student_entropy", _entropy(log_q.detach().exp()).mean()),
+        ]
+
+    def _row_loss(
+        self,
+        pool_norm: torch.Tensor,
+        pool_idx: torch.Tensor,
+        anchor_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[tuple[str, torch.Tensor]]]:
+        zero = pool_norm.new_zeros(())
+        pool_size = pool_idx.numel()
+        device = pool_idx.device
+
+        is_anchor = torch.zeros(pool_size, dtype=torch.bool, device=device)
+        is_anchor[anchor_pos] = True
+        if self.row_set == "anchors":
+            centers = is_anchor
+        elif self.row_set == "non_anchors":
+            centers = ~is_anchor
+        else:
+            centers = torch.ones_like(is_anchor)
+        positions = centers.nonzero(as_tuple=True)[0]
+        nodes = pool_idx.index_select(0, positions)
+
+        with torch.no_grad():
+            neighbors = self.row_neighbors.index_select(0, nodes)
+            probs = self.row_probs.index_select(0, nodes)
+            column = torch.searchsorted(pool_idx, neighbors.clamp_min(0)).clamp_max(
+                pool_size - 1
+            )
+            present = (
+                (neighbors >= 0)
+                & (pool_idx[column] == neighbors)
+                & (probs > 0)
+                & (column != positions.unsqueeze(1))
+            )
+            target = torch.zeros(nodes.numel(), pool_size, device=device)
+            target.scatter_add_(
+                1, column, torch.where(present, probs, torch.zeros_like(probs))
+            )
+            exposed = target.sum(-1)
+            allowed = target > 0
+            usable = allowed.sum(-1) >= 2
+
+        if not bool(usable.any()):
+            return zero, [(name, zero) for name in _ROW_METRICS]
+        positions, nodes = positions[usable], nodes[usable]
+        target, allowed, exposed = target[usable], allowed[usable], exposed[usable]
+        tau = self.row_temps.index_select(0, nodes).unsqueeze(1)
+
+        with torch.no_grad():
+            target = target / target.sum(-1, keepdim=True)
+            if self.row_columns == "random":
+                allowed, target = self._random_columns(
+                    positions, nodes, pool_idx, allowed, tau
+                )
+            if self.row_target == "uniform":
+                target = allowed.float() / allowed.sum(-1, keepdim=True)
+
+        logits = pool_norm.index_select(0, positions) @ pool_norm.t() / tau
+        log_q = F.log_softmax(logits.masked_fill(~allowed, float("-inf")), dim=-1)
+        kl = _kl_rows(target, log_q)
+        if self.row_weights is not None:
+            weights = self.row_weights.index_select(0, nodes)
+            loss = (weights * kl).sum() / weights.sum()
+            ess_ratio = weights.sum() ** 2 / (weights * weights).sum() / weights.numel()
+        else:
+            loss = kl.mean()
+            ess_ratio = zero + 1.0
+
+        detached = kl.detach()
+        return loss, [
+            ("row_count", zero + positions.numel()),
+            ("row_eff_denom", allowed.sum(-1).float().mean()),
+            ("row_exposed_mass", exposed.mean()),
+            ("row_exposed_mass_p10", exposed.quantile(0.10)),
+            ("row_exposed_mass_p90", exposed.quantile(0.90)),
+            ("row_teacher_entropy", _entropy(target).mean()),
+            ("row_kl_p50", detached.quantile(0.50)),
+            ("row_kl_p90", detached.quantile(0.90)),
+            ("row_ess_ratio", ess_ratio),
+        ]
+
+    @torch.no_grad()
+    def _random_columns(
+        self,
+        positions: torch.Tensor,
+        nodes: torch.Tensor,
+        pool_idx: torch.Tensor,
+        allowed: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each row keeps its width; its columns are drawn uniformly from the pool.
+
+        The target is the teacher's softmax at tau_j over the drawn columns, which on
+        the graph columns is exactly the renormalized transition row, so the only
+        change is *which* texts row j is compared against (Table 3, row 8).
+        """
+        rows, pool_size = allowed.shape
+        counts = allowed.sum(-1)
+        scores = torch.rand(rows, pool_size, device=allowed.device)
+        scores[torch.arange(rows, device=allowed.device), positions] = -1.0
+        kth = scores.sort(dim=-1, descending=True).values.gather(
+            1, (counts - 1).clamp_min(0).unsqueeze(1)
+        )
+        chosen = scores >= kth
+        bank = self.teacher_bank
+        logits = (
+            bank.index_select(0, nodes).float()
+            @ bank.index_select(0, pool_idx).float().t()
+        ) / tau
+        return chosen, F.softmax(logits.masked_fill(~chosen, float("-inf")), dim=-1)

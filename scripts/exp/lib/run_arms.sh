@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared graph-preparation and GPU-pool runner for scripts/exp/exp{1,2,4}_*.sh.
+# Shared graph-preparation and GPU-pool runner for scripts/exp/table*.sh.
 # This file is sourced; it deliberately does not change the caller's shell
 # options or execute anything until run_arms is called.
 
@@ -159,7 +159,7 @@ run_arms() {
         return 2
     fi
 
-    # ARMS=a,b runs a subset of a stage without editing its spec -- a fixed arm or
+    # ARMS=a,b runs a subset of a table without editing its spec -- a fixed arm or
     # a missing one. Export merges by (pair, arm, seed), so the new rows replace
     # the old ones in the same results.csv. Graphs no kept arm uses are not built.
     if [[ -n "${ARMS:-}" ]]; then
