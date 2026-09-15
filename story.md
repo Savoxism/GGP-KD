@@ -308,16 +308,13 @@ How to read it:
 
 ## 7. To do
 
-**Code** (before any `[final]` run):
-- **Graph default.** `neighbor_source` defaults to teacher (currently student).
-- **Anchors.** Include anchors in $\mathcal L_{\rm row}$ (currently excluded).
-- **Removed knob.** Delete `r1_weight`.
-- **New flag.** $1/\hat p_j$ reweighting.
-- **Graph-build stat.** Reciprocal-component count.
-- **Baseline arms.** PKT, SEED-style and CoSS-style.
-- **Held-out probe.** Split by component.
+**Code.** Done (2026-09-15): teacher graph default, anchors in $\mathcal L_{\rm row}$,
+`r1_weight` and every unused option removed, `--row_reweight`, reciprocal-component
+stats, one script per table plus `scripts/exp/launch.sh`, held-out probe split by
+component. PKT/SEED-style is `--batch_local`; CoSS-style is pointwise with
+`--batch_sampler neighbor`, on the same deduplicated corpus as the graph.
 
-**Runs** (3 seeds, teacher graph):
+**Runs** (3 seeds, teacher graph; `PROFILE=paper bash scripts/exp/launch.sh start`):
 1. Table 5, the $k$ sweep. It also provides the default reference.
 2. Table 3, then Table 4. Table 4 runs its own arms under the 0.2 holdout (its
    Avg is not comparable with Tables 3, 5, 6); the held-out probe scores its

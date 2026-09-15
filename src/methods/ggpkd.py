@@ -15,53 +15,7 @@ from src.ggpkd.graph_builder import (
 )
 from src.ggpkd.student_neighbors import encode_base_student
 from src.methods.spec import MethodSpec
-
-
-def resolve_anchor_column(ctx, df: pd.DataFrame) -> str:
-    cfg = ctx.config
-    column = cfg.ggpkd_anchor_column
-    if column is not None:
-        if column not in df.columns:
-            raise ValueError(
-                f"ggpkd_anchor_column={column!r} is not a column of "
-                f"{cfg.train_data_path} (have {list(df.columns)})"
-            )
-        return column
-
-    column = {"single_cls": "text", "pair_cls": "premise"}.get(
-        cfg.task_type, "sentence1"
-    )
-    if column not in df.columns:
-        raise ValueError(
-            f"GGPKD needs column {column!r} for task_type={cfg.task_type!r}"
-        )
-    # The graph is built over this column only; say so if a real second view exists.
-    partner = {"pair_cls": "hypothesis", "pair_reg": "sentence2"}.get(cfg.task_type)
-    if partner in df.columns and not df[column].equals(df[partner]):
-        print(
-            f"WARNING: GGPKD uses only {column!r}; {partner!r} differs from it and is "
-            "not distilled. Set ggpkd_anchor_column explicitly if that is not intended."
-        )
-    return column
-
-
-def prepare_frame(ctx, df: pd.DataFrame):
-    """Resolve the anchor column and drop exact duplicate anchors.
-
-    Two identical texts have cosine 1 for every parameter setting, so a duplicate
-    is a column with no gradient that still takes a pool slot.
-    """
-    ctx.ggpkd_anchor_column = resolve_anchor_column(ctx, df)
-    duplicated = (
-        df[ctx.ggpkd_anchor_column].astype(str).duplicated(keep="first").to_numpy()
-    )
-    keep = np.flatnonzero(~duplicated).astype(np.int64)
-    if duplicated.any():
-        print(
-            f"GGPKD corpus dedup on {ctx.ggpkd_anchor_column!r}: {len(df)} -> {keep.size} "
-            f"rows ({int(duplicated.sum())} exact duplicates removed)"
-        )
-    return df.iloc[keep].reset_index(drop=True), keep
+from src.methods.support import dedup_anchor_frame
 
 
 def build_data(ctx, df: pd.DataFrame, teacher_cls: torch.Tensor):
@@ -171,7 +125,7 @@ SPEC = MethodSpec(
     step=step,
     uses_teacher_cache=True,
     batch_relational=True,
-    prepare_frame=prepare_frame,
+    prepare_frame=dedup_anchor_frame,
     build_data=build_data,
     build_criterion=build_criterion,
 )

@@ -205,7 +205,6 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Corpus subsets for the exposure-scaling sweep. Regenerated deterministically by
-# scripts/exp/make_subsets.py from the three training CSVs, so the recipe is
-# version-controlled and the 7.5 MB of derived text is not.
+
+# Corpus subsets left over from the removed exposure-scaling sweep.
 data/train_set/scaling/

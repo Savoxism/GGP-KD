@@ -39,6 +39,26 @@ It then runs Tables 3, 4, 4-heldout, 6, 1 and 2.
 
 ---
 
+## One command
+
+`launch.sh` runs the whole plan detached: preflight, Table 5, the `graph_k`
+choice (`scripts/exp/select_graph_k.py`), then Tables 3, 4, 4h, 6, 1, 2 at that `k`.
+
+```bash
+GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start                 # pilot: SEEDS=42, 28 runs
+PROFILE=paper GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start   # SEEDS=42,43,44, 84 runs
+bash scripts/exp/launch.sh status          # phase, graph_k, completed/failed runs, log tail
+bash scripts/exp/launch.sh stop            # TERM the whole process group
+GRAPH_K=100 GPUS=4,5 bash scripts/exp/launch.sh start   # skip the choice
+```
+
+The `graph_k` rule: the larger of (a) the smallest `k` whose mean Avg is within
+`TOLERANCE` (0.2) of the best `k`, and (b) the smallest `k` whose reciprocal graph
+is about connected (`graph_reciprocal_largest_frac >= MIN_LARGEST_FRAC`, 0.995).
+Everything the controller needs is pinned in `runs/launch/<run_id>/env.sh`; the
+phases, the chosen `k` and the exit code sit beside it. The launcher warns when
+the working tree is dirty: commit first, so `SOURCE_COMMIT` names the code that ran.
+
 ## Table 5 — $k$ and reciprocal connectivity (C3)
 
 **Question.** Does Avg saturate at the $k$ where $G^\leftrightarrow$ becomes

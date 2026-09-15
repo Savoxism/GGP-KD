@@ -10,7 +10,7 @@ from config.pointwise_config import PointwiseConfig
 from src.criterions.pointwise_distillation import PointwiseDistillation
 from src.distill.steps.rkd import step
 from src.methods.spec import MethodSpec
-from src.methods.support import attach_parameters
+from src.methods.support import attach_parameters, dedup_anchor_frame
 
 
 def build_criterion(ctx, config):
@@ -46,5 +46,9 @@ SPEC = MethodSpec(
     # no two examples, so it takes a short final batch without changing meaning
     # and its result cannot depend on who shares a batch with whom.
     batch_relational=False,
+    # The corpus GGPKD builds its graph over. Without it `--batch_sampler neighbor`
+    # would index a row set of a different length, and the pointwise arms would
+    # train on different anchors than the arms they are compared with.
+    prepare_frame=dedup_anchor_frame,
     build_criterion=build_criterion,
 )

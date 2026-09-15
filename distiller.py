@@ -441,6 +441,12 @@ class KnowledgeDistiller:
             print(f"Batch composition reads the prebuilt graph: {path}")
             artifact = torch.load(path, map_location="cpu", weights_only=False)
         neighbors = artifact["transition_neighbors"].numpy()
+        if neighbors.shape[0] != len(self.train_ds):
+            raise ValueError(
+                f"batch_sampler={mode!r}: the graph has {neighbors.shape[0]} nodes but "
+                f"the training set has {len(self.train_ds)} rows, so node i is not "
+                "row i; build the graph over the same deduplicated corpus"
+            )
         sampler = NeighborBatchSampler(
             neighbors=neighbors,
             batch_size=self.config.batch_size,

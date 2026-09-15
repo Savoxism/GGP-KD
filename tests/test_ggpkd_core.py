@@ -612,3 +612,33 @@ def test_train_step_encodes_the_pool_once_and_updates_the_student(monkeypatch):
     assert metrics["loss_row"] > 0 and metrics["loss_cal"] > 0 and metrics["row_count"] > 0
     assert distiller.encoded_texts_total == batch["pool_idx"].numel()
     assert not torch.equal(before, distiller.model_student.embedding.weight.detach())
+
+
+# --------------------------------------------------------------------------- #
+# Corpus alignment for neighbour batching
+# --------------------------------------------------------------------------- #
+
+
+def test_pointwise_trains_on_the_corpus_the_graph_is_built_over():
+    import pandas as pd
+
+    df = pd.DataFrame({"text": ["a", "b", "a", "c", "b", "d"], "source": list("xxyyzz")})
+    ctx = SimpleNamespace(
+        config=SimpleNamespace(task_type="single_cls", ggpkd_anchor_column=None)
+    )
+    pointwise_df, pointwise_keep = get_method("pointwise").prepare_frame(ctx, df)
+    ggpkd_df, ggpkd_keep = get_method("ggpkd").prepare_frame(ctx, df)
+    assert pointwise_df["text"].tolist() == ggpkd_df["text"].tolist() == ["a", "b", "c", "d"]
+    np.testing.assert_array_equal(pointwise_keep, ggpkd_keep)
+
+
+def test_neighbor_batches_refuse_a_graph_over_another_corpus():
+    distiller = KnowledgeDistiller.__new__(KnowledgeDistiller)
+    distiller.config = SimpleNamespace(
+        batch_sampler="neighbor", batch_size=4, seed=0, distill_method="pointwise"
+    )
+    distiller.method = get_method("pointwise")
+    distiller.ggpkd_artifact = {"transition_neighbors": torch.zeros(10, 3, dtype=torch.long)}
+    distiller.train_ds = list(range(12))
+    with pytest.raises(ValueError, match="10 nodes"):
+        distiller.build_batch_sampler()
