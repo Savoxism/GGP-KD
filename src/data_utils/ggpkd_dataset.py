@@ -13,6 +13,8 @@ from torch.utils.data import Dataset
 from src.ggpkd.graph_builder import heldout_edge_mask
 from src.ggpkd.policy import ENCODE_CHUNK_SIZE, PAD_TO_MULTIPLE_OF
 
+POOL_SOURCES = ("graph", "random")
+
 
 class GGPKDAnchorDataset(Dataset):
     """Corpus positions of the deduplicated anchor texts."""
@@ -39,6 +41,12 @@ class GGPKDCollate:
         cal_exclude   [B, P] pairs withheld by the edge holdout (only with a holdout)
 
     `neighbors=None` is the in-batch baseline: the pool is the batch itself.
+
+    `pool_source='random'` is the same-size random pool of story.md §6.2 control A:
+    the anchors plus uniformly drawn corpus texts, as many as the graph pool would
+    have held for this very batch. Everything downstream is unchanged -- rows are
+    still Omega_j = N(j) ∩ pool under the same eligibility rule -- so the arm
+    separates *structured* exposure from encoding 4.7k texts instead of 64.
     """
 
     def __init__(
@@ -49,9 +57,17 @@ class GGPKDCollate:
         neighbors: np.ndarray | None,
         holdout_edge_frac: float = 0.0,
         holdout_seed: int = 0,
+        pool_source: str = "graph",
+        pool_seed: int = 0,
         encode_chunk_size: int = ENCODE_CHUNK_SIZE,
         pad_to_multiple_of: int = PAD_TO_MULTIPLE_OF,
     ):
+        if pool_source not in POOL_SOURCES:
+            raise ValueError(
+                f"pool_source must be one of {POOL_SOURCES}, got {pool_source!r}"
+            )
+        self.pool_source = pool_source
+        self.pool_seed = int(pool_seed)
         self.neighbors = (
             None
             if neighbors is None
@@ -95,6 +111,23 @@ class GGPKDCollate:
             "attention_mask": torch.from_numpy(attention_mask),
         }
 
+    def _random_pool(self, idx: np.ndarray, size: int) -> np.ndarray:
+        """The anchors plus uniformly drawn texts, up to `size` distinct texts.
+
+        Seeded from (pool_seed, the batch), so the pool is a pure function of what
+        the sampler drew: reproducible, identical in every dataloader worker, and
+        different for every batch an epoch produces.
+        """
+        n_items = len(self.corpus_ids)
+        outside = np.ones(n_items, dtype=bool)
+        outside[idx] = False
+        candidates = np.flatnonzero(outside)
+        extra = min(max(int(size) - idx.size, 0), candidates.size)
+        if extra == 0:
+            return idx
+        rng = np.random.default_rng([self.pool_seed, *(int(i) for i in idx)])
+        return np.concatenate([idx, rng.choice(candidates, size=extra, replace=False)])
+
     def __call__(self, batch: list[dict]) -> dict:
         idx = np.asarray([item["idx"] for item in batch], dtype=np.int64)
         if self.neighbors is None:
@@ -104,6 +137,10 @@ class GGPKDCollate:
         else:
             rows = self.neighbors[idx]
             nodes = np.concatenate([idx, rows[rows >= 0]])
+            if self.pool_source == "random":
+                # Matched per batch, not on average: the graph pool this batch
+                # would have had is the compute the control has to spend.
+                nodes = self._random_pool(idx, np.unique(nodes).size)
         pool_idx = np.unique(nodes)
         anchor_pos = np.searchsorted(pool_idx, idx)
 

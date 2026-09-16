@@ -292,6 +292,13 @@ TABLE_MATRIX = {
         "row_off": ("main_holdout", "ggpkd", "--row_weight 0"),
         "anchors_only": ("main_holdout", "ggpkd", "--row_set anchors"),
         "anchors_excluded": ("main_holdout", "ggpkd", "--row_set non_anchors"),
+        "holdout_strict": ("main_holdout_strict", "ggpkd", ""),
+    },
+    "table7_controls.sh": {
+        "shuffled_target": ("main", "ggpkd", "--row_target shuffled"),
+        "random_pool": ("main", "ggpkd", "--pool_source random"),
+        "dense_rows": ("main", "ggpkd", "--row_columns pool"),
+        "dense_rows_only": ("main", "ggpkd", "--row_columns pool --cal_weight 0"),
     },
     "table6_robustness.sh": {
         "cal_0p25": ("main", "ggpkd", "--cal_weight 0.25"),
@@ -322,10 +329,20 @@ def test_seeds_multiply_the_run_count():
     assert "runs:   24" in stdout
 
 
-def test_table4_trains_every_arm_on_the_same_holdout_graph():
+def test_table4_trains_every_arm_on_the_same_withheld_pairs():
+    """Two artifacts, one split.
+
+    `holdout_strict` needs its own artifact because it recomputes tau_j on the
+    surviving edges, but the withheld pairs are a pure function of (frac, seed),
+    which both graphs take from the same two variables -- so the held-out columns
+    of table4_heldout.sh score every arm on the same relations.
+    """
     stdout, _ = _table("table4_loss_terms.sh")
-    assert "graphs: 1" in stdout
     assert "holdout 0.2 (seed 12345)" in stdout
+    keys = {graph for graph, _, _ in _planned(stdout).values()}
+    assert keys == {"main_holdout", "main_holdout_strict"}
+    source = (REPO_ROOT / "scripts" / "exp" / "table4_loss_terms.sh").read_text()
+    assert source.count("--holdout_edge_frac $HOLDOUT_FRAC --holdout_seed $HOLDOUT_SEED") == 2
 
 
 def test_table4_refuses_to_run_without_a_holdout():

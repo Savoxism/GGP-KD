@@ -15,9 +15,18 @@ L_cal   For every anchor i, KL between the teacher's and the student's softmax
 Ablation switches, each at the method's value by default (story.md, Tables 3-6):
 
     row_set        all | anchors | non_anchors   which pool texts are rows
-    row_target     teacher | uniform             values on the same columns
-    row_columns    graph | random                same width, random pool columns
+    row_target     teacher | uniform | shuffled  values on the same columns
+    row_columns    graph | random | pool         which pool texts a row is scored on
     row_inclusion  None | P(j in pool)           weight rows by 1 / p_j
+
+`row_target='shuffled'` and `row_columns='pool'` are the two controls story.md
+§6.2 asks for. Shuffling permutes a row's teacher probabilities among its own
+columns: the support, the entropy and the histogram of values survive, only the
+assignment of a value to a neighbour is destroyed, so graded > shuffled is
+evidence about the values themselves rather than about membership or entropy.
+`row_columns='pool'` is dense relational KD on the same pool -- every eligible
+centre against every other encoded text -- the baseline the sparse local rows
+have to match at a lower pair count to be worth their complexity.
 """
 
 import math
@@ -30,8 +39,8 @@ from torch import nn
 from src.ggpkd.policy import EPS_NORM
 
 ROW_SETS = ("all", "anchors", "non_anchors")
-ROW_TARGETS = ("teacher", "uniform")
-ROW_COLUMNS = ("graph", "random")
+ROW_TARGETS = ("teacher", "uniform", "shuffled")
+ROW_COLUMNS = ("graph", "random", "pool")
 
 _ROW_METRICS = (
     "row_count",
@@ -264,6 +273,12 @@ class GGPKDDistillation(nn.Module):
             exposed = target.sum(-1)
             allowed = target > 0
             usable = allowed.sum(-1) >= 2
+            if self.row_columns == "pool":
+                # The dense control scores every centre against every other pool
+                # text, so how much of a row's teacher mass the graph put in the
+                # pool must not decide whether the row is supervised at all --
+                # that filter is exactly the exposure the control removes.
+                usable = torch.full_like(usable, pool_size >= 3)
 
         if not bool(usable.any()):
             return zero, [(name, zero) for name in _ROW_METRICS]
@@ -272,13 +287,20 @@ class GGPKDDistillation(nn.Module):
         tau = self.row_temps.index_select(0, nodes).unsqueeze(1)
 
         with torch.no_grad():
-            target = target / target.sum(-1, keepdim=True)
-            if self.row_columns == "random":
-                allowed, target = self._random_columns(
-                    positions, nodes, pool_idx, allowed, tau
+            # clamp_min: with row_columns='pool' a centre may have no graph mass in
+            # the pool at all, and its graph target is overwritten two lines below.
+            target = target / target.sum(-1, keepdim=True).clamp_min(1e-12)
+            if self.row_columns != "graph":
+                allowed = (
+                    self._random_columns(positions, allowed)
+                    if self.row_columns == "random"
+                    else self._pool_columns(positions, pool_size)
                 )
+                target = self._teacher_row_target(nodes, pool_idx, allowed, tau)
             if self.row_target == "uniform":
                 target = allowed.float() / allowed.sum(-1, keepdim=True)
+            elif self.row_target == "shuffled":
+                target = self._shuffled_target(target, allowed)
 
         logits = pool_norm.index_select(0, positions) @ pool_norm.t() / tau
         log_q = F.log_softmax(logits.masked_fill(~allowed, float("-inf")), dim=-1)
@@ -306,18 +328,12 @@ class GGPKDDistillation(nn.Module):
 
     @torch.no_grad()
     def _random_columns(
-        self,
-        positions: torch.Tensor,
-        nodes: torch.Tensor,
-        pool_idx: torch.Tensor,
-        allowed: torch.Tensor,
-        tau: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, positions: torch.Tensor, allowed: torch.Tensor
+    ) -> torch.Tensor:
         """Each row keeps its width; its columns are drawn uniformly from the pool.
 
-        The target is the teacher's softmax at tau_j over the drawn columns, which on
-        the graph columns is exactly the renormalized transition row, so the only
-        change is *which* texts row j is compared against (Table 3, row 8).
+        The only change is *which* texts row j is compared against (Table 3, row 8):
+        the values are still the teacher's softmax at tau_j over whatever was drawn.
         """
         rows, pool_size = allowed.shape
         counts = allowed.sum(-1)
@@ -326,10 +342,68 @@ class GGPKDDistillation(nn.Module):
         kth = scores.sort(dim=-1, descending=True).values.gather(
             1, (counts - 1).clamp_min(0).unsqueeze(1)
         )
-        chosen = scores >= kth
+        return scores >= kth
+
+    @torch.no_grad()
+    def _pool_columns(self, positions: torch.Tensor, pool_size: int) -> torch.Tensor:
+        """Every other encoded text is a column: dense relational KD on this pool.
+
+        This is the cost the sparse rows are measured against. It materializes the
+        same [rows, pool] matrix the graph target already uses, so it costs no more
+        memory -- what it costs is pair evaluations, which `row_eff_denom` reports.
+        """
+        rows = int(positions.numel())
+        allowed = torch.ones(
+            rows, pool_size, dtype=torch.bool, device=positions.device
+        )
+        allowed[torch.arange(rows, device=positions.device), positions] = False
+        return allowed
+
+    @torch.no_grad()
+    def _teacher_row_target(
+        self,
+        nodes: torch.Tensor,
+        pool_idx: torch.Tensor,
+        allowed: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """The teacher's softmax at tau_j over exactly the allowed columns.
+
+        On the graph columns this reproduces the renormalized transition row, so a
+        column switch changes the columns and nothing else about the target.
+        """
         bank = self.teacher_bank
         logits = (
             bank.index_select(0, nodes).float()
             @ bank.index_select(0, pool_idx).float().t()
         ) / tau
-        return chosen, F.softmax(logits.masked_fill(~chosen, float("-inf")), dim=-1)
+        return F.softmax(logits.masked_fill(~allowed, float("-inf")), dim=-1)
+
+    @torch.no_grad()
+    def _shuffled_target(
+        self, target: torch.Tensor, allowed: torch.Tensor
+    ) -> torch.Tensor:
+        """Permute each row's values among its own columns (story.md §6.1).
+
+        Support, entropy and the multiset of probabilities are preserved exactly;
+        only which neighbour carries which value changes. Uniform destroys the
+        values, this destroys only their assignment, so the two bracket what the
+        graded targets can be credited with.
+        """
+        rows, width = target.shape
+        device = target.device
+        # Allowed columns first, in index order, then the rest: `order` is the map
+        # between a row's column positions and its list of supervised columns.
+        order = allowed.to(torch.int8).argsort(dim=-1, descending=True, stable=True)
+        values = target.gather(1, order)
+        counts = allowed.sum(-1, keepdim=True)
+        slots = torch.arange(width, device=device).expand(rows, width)
+        keys = torch.where(
+            slots < counts,
+            torch.rand(rows, width, device=device),
+            torch.full((rows, width), float("inf"), device=device),
+        )
+        permuted = values.gather(1, keys.argsort(dim=-1))
+        shuffled = torch.zeros_like(target)
+        shuffled.scatter_(1, order, permuted)
+        return shuffled

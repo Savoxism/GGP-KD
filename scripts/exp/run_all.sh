@@ -8,18 +8,21 @@
 # re-invoke with GRAPH_K=<k>.
 #
 #   GPUS=0,1,2,3             bash scripts/exp/run_all.sh   # Table 5, then stop
-#   GRAPH_K=100 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Tables 3, 4, 6, 1, 2
+#   GRAPH_K=100 GPUS=0,1,2,3 bash scripts/exp/run_all.sh   # Tables 3, 7, 4, 6, 1, 2, 8
 #   DRY_RUN=1 GRAPH_K=100    bash scripts/exp/run_all.sh   # print the plan only
 #
-# Env: FROM / TO restrict the range (5, 3, 4, 4h, 6, 1, 2). Everything else is
-# forwarded to the table scripts.
+# Env: FROM / TO restrict the range (5, 3, 7, 4, 4h, 6, 1, 2, 8). Everything else
+# is forwarded to the table scripts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-TABLES=(5 3 4 4h 6 1 2)
+# 7 follows 3: it reads Table 3's `ours` as its reference row and the same graph
+# artifact. 8 is last -- it is the only table whose runs cost several times an
+# ordinary arm, and nothing reads it.
+TABLES=(5 3 7 4 4h 6 1 2 8)
 FROM="${FROM:-}"
 TO="${TO:-}"
 
@@ -45,6 +48,8 @@ script_for() {
         4)  echo "table4_loss_terms.sh" ;;
         4h) echo "table4_heldout.sh" ;;
         6)  echo "table6_robustness.sh" ;;
+        7)  echo "table7_controls.sh" ;;
+        8)  echo "table8_budget.sh" ;;
         1)  echo "table1_main.sh" ;;
         2)  echo "table2_cost.sh" ;;
     esac

@@ -47,6 +47,7 @@ def build_data(ctx, df: pd.DataFrame, teacher_cls: torch.Tensor):
         knn_mode=cfg.knn_mode,
         holdout_edge_frac=cfg.holdout_edge_frac,
         holdout_seed=cfg.holdout_seed,
+        holdout_bandwidth=cfg.holdout_bandwidth,
         **neighbor_kwargs,
     )
 
@@ -64,10 +65,19 @@ def build_data(ctx, df: pd.DataFrame, teacher_cls: torch.Tensor):
         neighbors=None if cfg.batch_local else neighbors,
         holdout_edge_frac=cfg.holdout_edge_frac,
         holdout_seed=cfg.holdout_seed,
+        pool_source=cfg.pool_source,
+        # The pool draw is part of the run, not of the graph: it moves with the
+        # training seed so two seeds of the control see two different pools.
+        pool_seed=int(getattr(cfg, "seed", 0) or 0),
     )
     if cfg.batch_local:
         print(
             f"GGPKD in-batch baseline: the pool is the batch ({cfg.batch_size} texts)"
+        )
+    elif cfg.pool_source == "random":
+        print(
+            f"GGPKD random-pool control: {cfg.batch_size} anchors plus uniformly "
+            "drawn texts, as many as this batch's graph pool would have held"
         )
     else:
         degree = (neighbors >= 0).sum(axis=1)
@@ -114,6 +124,7 @@ def build_criterion(ctx, config):
         f"cal_temp={config.cal_temp:.4f} row_set={config.row_set} "
         f"row_target={config.row_target} row_columns={config.row_columns} "
         f"row_reweight={config.row_reweight} batch_local={config.batch_local} "
+        f"pool_source={config.pool_source} "
         f"neighbor_source={config.neighbor_source}"
     )
     return criterion

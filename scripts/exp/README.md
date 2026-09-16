@@ -1,17 +1,17 @@
 # Experiments
 
-One script per table of `story.md` §5. Every training arm runs through the same
+One script per table of the run plan in `experiments.md`. Every training arm runs through the same
 runner (`lib/run_arms.sh`) and `scripts/ggpkd/train.sh`, so two arms that differ
 in one flag differ in nothing else.
 
 ## One command (server)
 
 `launch.sh` runs the whole plan detached: preflight, Table 5, the `graph_k`
-choice (`select_graph_k.py`), then Tables 3, 4, 4h, 6, 1, 2 at that `k`.
+choice (`select_graph_k.py`), then Tables 3, 7, 4, 4h, 6, 1, 2, 8 at that `k`.
 
 ```bash
-GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start                 # pilot: SEEDS=42, 28 runs
-PROFILE=paper GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start   # SEEDS=42,43,44, 84 runs
+GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start                 # pilot: SEEDS=42, 40 runs
+PROFILE=paper GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start   # SEEDS=42,43,44, 106 runs
 bash scripts/exp/launch.sh status          # phase, graph_k, completed/failed runs, log tail
 bash scripts/exp/launch.sh stop            # TERM the whole process group
 GRAPH_K=100 GPUS=4,5 bash scripts/exp/launch.sh start   # skip the choice
@@ -33,11 +33,11 @@ judgement call and no script may guess it.
 ```bash
 GPUS=0,1,2,3              bash scripts/exp/run_all.sh   # Table 5, then stop
 column -s, -t runs/table5_graph_k/results.csv | less -S
-GRAPH_K=<k> GPUS=0,1,2,3  bash scripts/exp/run_all.sh   # Tables 3, 4, 4h, 6, 1, 2
+GRAPH_K=<k> GPUS=0,1,2,3  bash scripts/exp/run_all.sh   # Tables 3, 7, 4, 4h, 6, 1, 2, 8
 DRY_RUN=1 GRAPH_K=100     bash scripts/exp/run_all.sh   # print the plan only
 ```
 
-`FROM` / `TO` restrict the range (`5`, `3`, `4`, `4h`, `6`, `1`, `2`). On the
+`FROM` / `TO` restrict the range (`5`, `3`, `7`, `4`, `4h`, `6`, `1`, `2`, `8`). On the
 second pass Table 5 is skipped when its CSV already holds `graph_k_<GRAPH_K>`,
 and otherwise run at that one `k`, because that run is Table 6's default row and
 Table 1's pair (c).
@@ -46,11 +46,13 @@ Table 1's pair (c).
 |---|---|---|---|
 | 5 | `table5_graph_k.sh` | `graph_k_25`, `graph_k_50`, `graph_k_100`, `graph_k_200` | 4 |
 | 3 | `table3_exposure.sh` | `pointwise_random`, `pointwise_neighbor`, `in_batch_random`, `in_batch_neighbor`, `anchor_rows`, `ours`, `uniform_target`, `random_columns` | 8 |
-| 4 | `table4_loss_terms.sh` | `ours`, `cal_off`, `row_off`, `anchors_only`, `anchors_excluded` | 5 |
+| 4 | `table4_loss_terms.sh` | `ours`, `cal_off`, `row_off`, `anchors_only`, `anchors_excluded`, `holdout_strict` | 6 |
 | 4 (held-out) | `table4_heldout.sh` | post-hoc on Table 4's checkpoints | 0 |
 | 6 | `table6_robustness.sh` | `cal_0p25`, `cal_1p0`, `row_reweight`, `student_knn`, `mutual_knn`, `global_tau` | 6 |
 | 1 | `table1_main.sh` | `ours` on each of `PAIRS` | 1 per pair |
 | 2 | `table2_cost.sh` | `pointwise`, `in_batch`, `ours` | 3 |
+| 7 | `table7_controls.sh` | `shuffled_target`, `random_pool`, `dense_rows`, `dense_rows_only` | 4 |
+| 8 | `table8_budget.sh` | `ours_e5`, `pointwise_e{5,10,20}`, `in_batch_e{5,10,20}` | 7, one seed |
 
 What each arm changes, relative to the method with no flags:
 
@@ -67,6 +69,11 @@ What each arm changes, relative to the method with no flags:
   (`--holdout_edge_frac 0.2 --holdout_seed 12345`, env `HOLDOUT_FRAC` /
   `HOLDOUT_SEED`): `--cal_weight 0`, `--row_weight 0`, `--row_set anchors`,
   `--row_set non_anchors`. Its `ours` arm is the reference, not Table 5's.
+  `holdout_strict` trains on a second artifact, `main_holdout_strict`
+  (`--holdout_bandwidth surviving`): the same withheld pairs, but $\tau_j$
+  recomputed on the edges the holdout left. Under the default the withheld
+  teacher scores still set $\tau_j$, so the split withholds target values, not
+  information -- this arm says how much that mattered.
 * **Table 4 held-out** — `heldout_geometry.py` over the latest Table 4 run tree
   (or `RUN_ROOT`) against `graph_main_holdout.pt`. The two columns are `spearman`
   on `heldout_same_component` and `heldout_cross_component`: held-out edges split
@@ -83,6 +90,14 @@ What each arm changes, relative to the method with no flags:
   result tree `results/table1_main/<pair>/<run_id>`.
 * **Table 2** — `JOBS_PER_GPU` is forced to 1 so step time and peak memory are
   read on unshared GPUs.
+* **Table 7** — the attribution controls: `--row_target shuffled` (the teacher's
+  own values permuted among the same columns), `--pool_source random` (the same
+  number of texts encoded per step, drawn uniformly), `--row_columns pool` (dense
+  relational KD on the same pool, with and without `--cal_weight 0`). The
+  reference row is Table 3's `ours`; the script warns if it is missing.
+* **Table 8** — the budget curve: the baselines at `BUDGET_EPOCHS` (default
+  `5,10,20`) against the method at `EPOCHS`. One seed unless `BUDGET_SEEDS` says
+  otherwise, and read on `train_encoded_tokens_cum`, not on steps.
 
 ## Environment
 
@@ -94,6 +109,9 @@ What each arm changes, relative to the method with no flags:
 | `PAIR` | `qwen3_0_6b_to_minilmv2_h384` | teacher->student pair (Tables 2-6) |
 | `PAIRS` | see Table 1 | pairs for Table 1 |
 | `GRAPH_KS` | `25,50,100,200` | Table 5 sweep |
+| `BUDGET_EPOCHS` | `5,10,20` | Table 8 ladder |
+| `BUDGET_SEEDS` | first of `SEEDS` | seeds for Table 8 only |
+| `HOLDOUT_FRAC`, `HOLDOUT_SEED` | `0.2`, `12345` | Table 4 edge split |
 | `CORPUS` | `data/train_set/merged_3_data_5k_each.csv` | training CSV |
 | `CACHE_ROOT` | `cache/exp` | teacher caches and graphs, `<pair>/<corpus>/graph_<key>.pt` |
 | `JOBS_PER_GPU` | `1` | concurrent runs per GPU (ignored by Table 2) |

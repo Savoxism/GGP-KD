@@ -7,6 +7,14 @@
 #   row_off           --row_weight 0      L_cal alone
 #   anchors_only      --row_set anchors   the removed L_{r=1} as a row term
 #   anchors_excluded  --row_set non_anchors
+#   holdout_strict    the method under a holdout whose withheld scores also stay
+#                     out of tau_j (--holdout_bandwidth surviving). The default
+#                     reads tau_j = (s(1) - s(k)) / log k off the raw top-k, so a
+#                     withheld pair's teacher score still shapes its row: that
+#                     makes the default a *target-only* holdout (story.md §6.4).
+#                     If this arm matches `ours` on the held-out columns, the
+#                     probe is not measuring the leak; if it does not, the
+#                     held-out numbers have to be reported under this arm.
 #
 # Every arm withholds the same 20% of graph edges from every training term, so
 # scripts/exp/table4_heldout.sh can score the checkpoints on relations none of
@@ -42,13 +50,15 @@ fi
 # be identical across seeds and arms, or the held-out columns do not score the
 # same withheld pairs. The key carries `_holdout` because the cache path is
 # graph_<key>.pt, and table4_heldout.sh reads exactly that file.
-GRAPH_SPEC="main_holdout|$CORPUS|$(method_graph_flags) --holdout_edge_frac $HOLDOUT_FRAC --holdout_seed $HOLDOUT_SEED"
+GRAPH_SPEC="main_holdout|$CORPUS|$(method_graph_flags) --holdout_edge_frac $HOLDOUT_FRAC --holdout_seed $HOLDOUT_SEED
+main_holdout_strict|$CORPUS|$(method_graph_flags) --holdout_edge_frac $HOLDOUT_FRAC --holdout_seed $HOLDOUT_SEED --holdout_bandwidth surviving"
 
 ARMS_SPEC="ours|main_holdout|ggpkd|
 cal_off|main_holdout|ggpkd|--cal_weight 0
 row_off|main_holdout|ggpkd|--row_weight 0
 anchors_only|main_holdout|ggpkd|--row_set anchors
 anchors_excluded|main_holdout|ggpkd|--row_set non_anchors
+holdout_strict|main_holdout_strict|ggpkd|
 "
 
 CSV_OUT="${CSV_OUT:-$STAGE_REPO_ROOT/runs/$EXPERIMENT/results.csv}"
@@ -58,6 +68,8 @@ export GRAPH_SPEC ARMS_SPEC CSV_OUT
 echo "Table 4: loss terms at graph_k=$GRAPH_K, holdout $HOLDOUT_FRAC (seed $HOLDOUT_SEED)"
 note "absolute numbers do not line up with Tables 1 and 5, which withhold"
 note "nothing; the comparison that matters is between these arms"
+note "holdout_strict trains on its own artifact (graph_main_holdout_strict.pt);"
+note "it withholds the same pairs, so table4_heldout.sh scores it on the same set"
 echo
 
 status=0

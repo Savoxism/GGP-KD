@@ -43,7 +43,7 @@ def _graph(n_items=80, dim=12, k=8, seed=0, holdout=0.0):
     teacher = torch.randn(n_items, dim)
     top_indices, top_scores = _compute_topk_cosine(teacher, k=k, device=torch.device("cpu"))
     temps = _knn_bandwidths(top_scores, k)
-    rows, probs, _, _, _ = _build_transition(
+    rows, probs, _, _, temps, _ = _build_transition(
         top_indices, top_scores, k, temps, holdout_edge_frac=holdout, holdout_seed=7
     )
     neighbors, padded_probs = _pad_rows(rows, probs)
@@ -83,7 +83,7 @@ def _texts(n_items):
     return [f"t {i}" for i in range(n_items)]
 
 
-def _batch(graph, anchors, holdout=0.0, chunk=16):
+def _batch(graph, anchors, holdout=0.0, chunk=16, **kwargs):
     collate = GGPKDCollate(
         _Tok(),
         16,
@@ -92,6 +92,7 @@ def _batch(graph, anchors, holdout=0.0, chunk=16):
         holdout_edge_frac=holdout,
         holdout_seed=7,
         encode_chunk_size=chunk,
+        **kwargs,
     )
     return collate([{"idx": int(i)} for i in anchors])
 
@@ -123,6 +124,8 @@ def test_config_defaults_are_the_method():
     assert config.row_reweight is False
     assert config.batch_local is False
     assert config.batch_sampler == "random"
+    assert config.pool_source == "graph"
+    assert config.holdout_bandwidth == "full"
 
 
 def test_cli_sets_every_switch(monkeypatch):
@@ -169,6 +172,11 @@ def test_batch_local_turns_the_row_term_off(monkeypatch):
         ("--row_reweight", "--row_set", "anchors"),
         ("--row_reweight", "--batch_sampler", "neighbor"),
         ("--row_target", "uniform", "--row_weight", "0"),
+        ("--row_columns", "pool", "--holdout_edge_frac", "0.2"),
+        ("--holdout_bandwidth", "surviving"),
+        ("--holdout_edge_frac", "0.2", "--holdout_bandwidth", "surviving", "--fixed_bandwidth"),
+        ("--pool_source", "random", "--batch_local"),
+        ("--row_target", "shuffled", "--row_weight", "0"),
     ],
 )
 def test_contradictory_arms_are_refused(monkeypatch, flags):
@@ -211,7 +219,7 @@ def test_directed_rows_keep_every_retrieved_column_and_mutual_is_a_subset():
     temps = _knn_bandwidths(top_scores, 8)
     edges = {}
     for mode in ("directed", "mutual"):
-        rows, _, _, _, _ = _build_transition(top_indices, top_scores, 8, temps, knn_mode=mode)
+        rows, _, _, _, _, _ = _build_transition(top_indices, top_scores, 8, temps, knn_mode=mode)
         edges[mode] = {(i, int(j)) for i, row in enumerate(rows) for j in row}
         if mode == "directed":
             assert all(len(row) == 8 for row in rows)
@@ -449,7 +457,7 @@ def test_inclusion_weights_give_a_weighted_row_mean():
 def test_the_teacher_itself_has_zero_loss():
     graph = _graph()
     batch = _batch(graph, [4, 8, 15, 16])
-    for kwargs in ({}, {"row_columns": "random"}):
+    for kwargs in ({}, {"row_columns": "random"}, {"row_columns": "pool"}):
         loss, metrics = _forward(_criterion(graph, **kwargs), graph["teacher"], batch)
         assert metrics["loss_row"] == pytest.approx(0.0, abs=1e-5)
         assert metrics["loss_cal"] == pytest.approx(0.0, abs=1e-5)
@@ -499,7 +507,9 @@ def test_calibration_exclusion_removes_the_withheld_pairs():
         {"row_set": "anchors"},
         {"row_set": "non_anchors"},
         {"row_target": "uniform"},
+        {"row_target": "shuffled"},
         {"row_columns": "random"},
+        {"row_columns": "pool"},
         {"cal_weight": 0.0},
         {"row_weight": 0.0},
     ],
@@ -642,3 +652,183 @@ def test_neighbor_batches_refuse_a_graph_over_another_corpus():
     distiller.train_ds = list(range(12))
     with pytest.raises(ValueError, match="10 nodes"):
         distiller.build_batch_sampler()
+
+
+# --------------------------------------------------------------------------- #
+# Controls of story.md §6.2: shuffled values, the dense pool, the random pool
+# --------------------------------------------------------------------------- #
+
+
+def test_shuffled_target_keeps_the_values_and_destroys_their_assignment():
+    """Graded > uniform can be entropy; graded > shuffled cannot.
+
+    Uniform changes the support's values *and* their spread, so beating it is also
+    consistent with "any peaked local target helps". Shuffling keeps the multiset
+    of teacher probabilities on exactly the same columns and only moves them
+    between neighbours, which is the thing the story credits.
+    """
+    graph = _graph()
+    embeddings = torch.randn(80, 12)
+    batch = _batch(graph, [1, 2, 3, 4])
+    _, teacher = _forward(_criterion(graph, cal_weight=0.0), embeddings, batch)
+    torch.manual_seed(0)
+    _, shuffled = _forward(
+        _criterion(graph, cal_weight=0.0, row_target="shuffled"), embeddings, batch
+    )
+    assert shuffled["row_count"] == teacher["row_count"]
+    assert shuffled["row_eff_denom"] == pytest.approx(teacher["row_eff_denom"])
+    assert shuffled["row_teacher_entropy"] == pytest.approx(
+        teacher["row_teacher_entropy"], rel=1e-5
+    )
+    assert shuffled["loss_row"] != pytest.approx(teacher["loss_row"])
+
+
+def test_shuffled_target_is_a_permutation_of_each_row():
+    graph = _graph()
+    criterion = _criterion(graph)
+    target = torch.zeros(3, 6)
+    target[0, [0, 2, 5]] = torch.tensor([0.5, 0.3, 0.2])
+    target[1, [1, 3]] = torch.tensor([0.9, 0.1])
+    target[2, [0, 1, 2, 3]] = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    allowed = target > 0
+    torch.manual_seed(1)
+    shuffled = criterion._shuffled_target(target, allowed)
+    assert torch.equal(shuffled > 0, allowed)
+    for row in range(target.size(0)):
+        original = target[row][allowed[row]].sort().values
+        permuted = shuffled[row][allowed[row]].sort().values
+        assert torch.allclose(original, permuted)
+    # Over enough rows at least one value has actually moved.
+    assert not torch.allclose(shuffled, target)
+
+
+def test_pool_columns_supervise_every_centre_against_the_whole_pool():
+    """The dense same-pool baseline: no graph, no eligibility, all pairs.
+
+    `row_eff_denom` is what makes it a cost comparison rather than a quality one:
+    the dense arm buys its columns at P-1 per row, the method at the row width.
+    """
+    graph = _graph()
+    embeddings = torch.randn(80, 12)
+    batch = _batch(graph, [1, 2, 3, 4])
+    pool_size = batch["pool_idx"].numel()
+    _, sparse = _forward(_criterion(graph, cal_weight=0.0), embeddings, batch)
+    _, dense = _forward(
+        _criterion(graph, cal_weight=0.0, row_columns="pool"), embeddings, batch
+    )
+    assert dense["row_count"] == pool_size
+    assert dense["row_count"] >= sparse["row_count"]
+    assert dense["row_eff_denom"] == pytest.approx(pool_size - 1)
+    assert dense["row_eff_denom"] > sparse["row_eff_denom"]
+
+
+def test_pool_columns_also_supervise_rows_the_graph_left_unexposed():
+    """A centre with no graph mass in the pool is dropped by the method and kept
+    by the dense control: that difference is the control."""
+    graph = _graph()
+    neighbors = graph["neighbors"].copy()
+    # Strip one pool text's row so it has no eligible graph columns at all.
+    batch = _batch(graph, [1, 2, 3, 4])
+    orphan = int(batch["pool_idx"][-1])
+    neighbors[orphan] = -1
+    stripped = {**graph, "neighbors": neighbors}
+    embeddings = torch.randn(80, 12)
+    _, before = _forward(_criterion(graph, cal_weight=0.0), embeddings, batch)
+    _, sparse = _forward(_criterion(stripped, cal_weight=0.0), embeddings, batch)
+    _, dense = _forward(
+        _criterion(stripped, cal_weight=0.0, row_columns="pool"), embeddings, batch
+    )
+    assert sparse["row_count"] == before["row_count"] - 1
+    assert dense["row_count"] == batch["pool_idx"].numel()
+
+
+def test_random_pool_matches_the_graph_pools_size_for_that_batch():
+    """Control A: same texts encoded, same compute, no neighbourhood structure."""
+    graph = _graph()
+    anchors = [1, 2, 3, 4]
+    graph_batch = _batch(graph, anchors)
+    random_batch = _batch(graph, anchors, pool_source="random", pool_seed=42)
+    assert random_batch["pool_idx"].numel() == graph_batch["pool_idx"].numel()
+    assert set(anchors) <= set(random_batch["pool_idx"].tolist())
+    anchor_idx = random_batch["pool_idx"][random_batch["anchor_pos"]]
+    assert sorted(anchor_idx.tolist()) == anchors
+
+
+def test_random_pool_is_reproducible_from_the_seed_and_the_batch():
+    graph = _graph()
+    anchors = [5, 6, 7, 8]
+    first = _batch(graph, anchors, pool_source="random", pool_seed=42)
+    again = _batch(graph, anchors, pool_source="random", pool_seed=42)
+    other_seed = _batch(graph, anchors, pool_source="random", pool_seed=7)
+    other_batch = _batch(graph, [9, 10, 11, 12], pool_source="random", pool_seed=42)
+    assert torch.equal(first["pool_idx"], again["pool_idx"])
+    assert not torch.equal(first["pool_idx"], other_seed["pool_idx"])
+    assert not torch.equal(first["pool_idx"], other_batch["pool_idx"])
+
+
+def test_random_pool_lowers_the_exposure_it_is_meant_to_remove():
+    graph = _graph()
+    embeddings = torch.randn(80, 12)
+    anchors = [1, 2, 3, 4]
+    _, structured = _forward(
+        _criterion(graph, cal_weight=0.0), embeddings, _batch(graph, anchors)
+    )
+    _, drawn = _forward(
+        _criterion(graph, cal_weight=0.0),
+        embeddings,
+        _batch(graph, anchors, pool_source="random", pool_seed=42),
+    )
+    assert drawn["row_exposed_mass"] < structured["row_exposed_mass"]
+
+
+def test_surviving_bandwidth_reads_tau_off_the_edges_the_holdout_left():
+    """story.md §6.4: with the default the withheld scores still set tau_j.
+
+    The default is kept -- it is what every recorded run used -- but the arm has to
+    exist, or "held out from every training term" is not a statement the code can
+    back.
+    """
+    torch.manual_seed(0)
+    teacher = torch.randn(60, 10)
+    top_indices, top_scores = _compute_topk_cosine(teacher, k=8, device=torch.device("cpu"))
+    temps = _knn_bandwidths(top_scores, 8)
+    _, _, _, _, full, _ = _build_transition(
+        top_indices, top_scores, 8, temps, holdout_edge_frac=0.3, holdout_seed=7
+    )
+    rows, _, scores, _, surviving, stats = _build_transition(
+        top_indices, top_scores, 8, temps, holdout_edge_frac=0.3, holdout_seed=7,
+        holdout_bandwidth="surviving",
+    )
+    np.testing.assert_allclose(full, temps)
+    assert not np.allclose(surviving, temps)
+    assert (surviving > 0).all()
+    assert stats["rebandwidthed_rows"] == sum(1 for row in rows if row.size >= 2)
+    # Each row's tau is the same rule applied to what is left.
+    for i, row_scores in enumerate(scores):
+        if row_scores.size < 2:
+            continue
+        span = float(row_scores[0] - row_scores[-1])
+        assert surviving[i] == pytest.approx(
+            max(span / np.log(row_scores.size), 1e-6), rel=1e-6
+        )
+
+
+def test_artifact_separates_the_two_holdout_bandwidths(tmp_path):
+    torch.manual_seed(0)
+    teacher = torch.randn(40, 8)
+    path = tmp_path / "graph.pt"
+    common = dict(
+        cache_path=str(path),
+        log_dir=str(tmp_path / "logs"),
+        graph_k=6,
+        holdout_edge_frac=0.2,
+        holdout_seed=3,
+    )
+    full = build_or_load_ggpkd_artifact(teacher_embeddings=teacher, **common)
+    full_temps = full["row_temps"].clone()
+    surviving = build_or_load_ggpkd_artifact(
+        teacher_embeddings=teacher, holdout_bandwidth="surviving", **common
+    )
+    assert full["metadata"]["holdout_bandwidth"] == "full"
+    assert surviving["metadata"]["holdout_bandwidth"] == "surviving"
+    assert not torch.allclose(full_temps, surviving["row_temps"])

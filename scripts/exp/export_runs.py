@@ -60,6 +60,8 @@ CONFIG_FIELDS = (
     "fixed_bandwidth",
     "holdout_edge_frac",
     "holdout_seed",
+    "holdout_bandwidth",
+    "pool_source",
     "cal_weight",
     "row_weight",
     "row_set",

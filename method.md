@@ -29,7 +29,11 @@ Built by `src/ggpkd/graph_builder.py`, cached at `--ggpkd_cache_path`
 5. **Holdout (Table 4 only).** `--holdout_edge_frac f` withholds a fraction $f$
    of edges before the rows are normalized. The split is a symmetric hash of the
    unordered pair and `--holdout_seed`, so it is the same across arms and seeds,
-   and the evaluation can recompute it.
+   and the evaluation can recompute it. $\tau_j$ is still read off the raw
+   top-$k$, so a withheld pair's teacher score shapes its row's targets: the
+   default is a holdout of the *target values*, not of the information.
+   `--holdout_bandwidth surviving` closes that path and is the arm that says how
+   much it mattered.
 
 Graph-build stats go to `<ggpkd_log_dir>/knn_graph_neighbors.jsonl`. They
 include `reciprocal_components`, `reciprocal_isolated`,
@@ -112,11 +116,15 @@ value. The table and row numbers refer to `story.md` §5.
 | `--row_set` | `all` | `anchors` | $\mathcal L_{\rm row}$ over anchor rows only | T3 row 5; T4 |
 | | | `non_anchors` | $\mathcal L_{\rm row}$ excludes anchors | T4 last row |
 | `--row_target` | `teacher` | `uniform` | same columns, equal mass on each | T3 row 7 |
+| | | `shuffled` | same columns and the teacher's own values, permuted among them: support, entropy and the histogram of probabilities are preserved, only which neighbour carries which value is destroyed | T7 |
 | `--row_columns` | `graph` | `random` | same width $\lvert\Omega_j\rvert$, columns drawn uniformly from the pool; target is the teacher softmax at $\tau_j$ over them. Not allowed with a holdout | T3 row 8 |
+| | | `pool` | every other pool text is a column and every pool text is a row centre (dense relational KD on the same pool); the eligibility rule is dropped, so `row_eff_denom` becomes $\lvert\mathcal P_B\rvert-1$. Not allowed with a holdout | T7 |
+| `--pool_source` | `graph` | `random` | the pool is the anchors plus uniformly drawn corpus texts, as many as that batch's graph pool would have held; rows are still $N(j)\cap\mathcal P_B$ under the same eligibility rule. Holds the pool's compute fixed and removes only its structure | T7 |
 | `--cal_weight` | 0.5 | 0 | $\mathcal L_{\rm row}$ only | T4 |
 | | | 0.25, 1.0 | ratio robustness | T6 |
 | `--row_weight` | 1.0 | 0 | $\mathcal L_{\rm cal}$ over the subgraph pool only | T4 |
 | `--holdout_edge_frac` | 0 | 0.2 | withhold edges from every term, for the held-out probe | T4 |
+| `--holdout_bandwidth` | `full` | `surviving` | recompute $\tau_j$ on the edges the holdout left. Under `full` a withheld pair's teacher score still enters $\tau_j$ (and through the median, $\bar\tau$), which makes the default a *target-only* holdout | T4 |
 | `--graph_k` | 100 | 25, 50, 200 | width and sharpness | T5 |
 | `--row_reweight` | off | on | weight row $j$ by $1/p_j$, with $p_j=1-\binom{N-\mathrm{indeg}(j)-1}{B}/\binom{N}{B}$ exact (GraphSAINT normalization). Needs `row_set` ≠ `anchors` and the random sampler | T6 |
 | `--neighbor_source` | `teacher` | `student` | $N(j)$ from the frozen base student's top-$k$; target values and $\tau_j$ stay the teacher's | T6 |

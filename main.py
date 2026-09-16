@@ -73,6 +73,13 @@ def parse_args():
     )
     parser.add_argument("--holdout_seed", type=int, default=None)
     parser.add_argument(
+        "--holdout_bandwidth",
+        choices=["full", "surviving"],
+        default=None,
+        help="Whether tau_j is read off the raw top-k (target-only holdout) or off "
+        "the edges the holdout left",
+    )
+    parser.add_argument(
         "--cal_weight", type=float, default=None, help="Weight of L_cal"
     )
     parser.add_argument(
@@ -86,20 +93,29 @@ def parse_args():
     )
     parser.add_argument(
         "--row_target",
-        choices=["teacher", "uniform"],
+        choices=["teacher", "uniform", "shuffled"],
         default=None,
-        help="Row target values: teacher softmax (method) or uniform on the same columns",
+        help="Row target values: teacher softmax (method), uniform on the same "
+        "columns, or the teacher's own values permuted among them",
     )
     parser.add_argument(
         "--row_columns",
-        choices=["graph", "random"],
+        choices=["graph", "random", "pool"],
         default=None,
-        help="Row columns: graph neighbours in the pool (method) or random pool texts",
+        help="Row columns: graph neighbours in the pool (method), random pool texts, "
+        "or every other pool text (dense relational KD on the same pool)",
     )
     parser.add_argument(
         "--row_reweight",
         action="store_true",
         help="Weight each row by 1/P(text in pool) (GraphSAINT normalization)",
+    )
+    parser.add_argument(
+        "--pool_source",
+        choices=["graph", "random"],
+        default=None,
+        help="Pool texts: the anchors' graph rows (method) or the same number of "
+        "uniformly drawn corpus texts",
     )
     parser.add_argument(
         "--batch_local",
@@ -223,6 +239,8 @@ def get_config(method: str, args):
         "knn_mode",
         "holdout_edge_frac",
         "holdout_seed",
+        "holdout_bandwidth",
+        "pool_source",
         "cal_weight",
         "row_weight",
         "row_set",

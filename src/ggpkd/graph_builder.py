@@ -29,6 +29,7 @@ from tqdm import tqdm
 ARTIFACT_VERSION = 12
 
 KNN_MODES = ("directed", "mutual")
+HOLDOUT_BANDWIDTHS = ("full", "surviving")
 NEIGHBOR_SOURCES = ("teacher", "student")
 
 # A row whose k neighbours all tie in cosine is uniform at every temperature; the
@@ -255,8 +256,11 @@ def _build_transition(
     knn_mode: str = "directed",
     holdout_edge_frac: float = 0.0,
     holdout_seed: int = 0,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray, dict]:
-    """Neighbour lists and transition rows.
+    holdout_bandwidth: str = "full",
+) -> tuple[
+    list[np.ndarray], list[np.ndarray], list[np.ndarray], np.ndarray, np.ndarray, dict
+]:
+    """Neighbour lists, transition rows, and the bandwidth each row was built at.
 
     * ``directed`` (method): keep all of topk(i), so every row has k columns.
     * ``mutual``: keep j iff i is also in topk(j); a row left empty falls back to
@@ -264,9 +268,21 @@ def _build_transition(
 
     `holdout_edge_frac` withholds a symmetric subset of the surviving edges before
     the rows are normalized; the rows renormalize over what is left.
+
+    `holdout_bandwidth` decides whether the withheld edges still reach training
+    through tau_j. ``full`` (the default) keeps tau_j = (s(1) - s(k)) / log k off
+    the raw top-k, so a held-out pair's teacher score shapes every target in its
+    row: that is a *target-only* holdout and story.md §6.4 requires it to be called
+    one. ``surviving`` recomputes tau_j on what the holdout left, which is what an
+    information holdout needs.
     """
     if knn_mode not in KNN_MODES:
         raise ValueError(f"knn_mode must be one of {KNN_MODES}, got {knn_mode!r}")
+    if holdout_bandwidth not in HOLDOUT_BANDWIDTHS:
+        raise ValueError(
+            f"holdout_bandwidth must be one of {HOLDOUT_BANDWIDTHS}, "
+            f"got {holdout_bandwidth!r}"
+        )
     n_items = top_indices.shape[0]
     top_sets = (
         [set(top_indices[i, :graph_k].tolist()) for i in range(n_items)]
@@ -275,8 +291,10 @@ def _build_transition(
     )
     row_neighbors, row_probs, row_scores = [], [], []
     fallback_flags = np.zeros(n_items, dtype=bool)
+    row_temps = np.asarray(row_temps, dtype=np.float64).copy()
     held_out_edges = 0
     holdout_starved = 0
+    rebandwidthed = 0
 
     for i in tqdm(range(n_items), desc=f"GGPKD {knn_mode} kNN graph"):
         neighbors = top_indices[i, :graph_k].astype(np.int64)
@@ -306,6 +324,12 @@ def _build_transition(
                 holdout_starved += 1
                 withheld[0] = False
             neighbors, scores = neighbors[~withheld], scores[~withheld]
+            if holdout_bandwidth == "surviving" and scores.size >= 2:
+                # The same rule, read off the row that training actually sees:
+                # the m-th surviving neighbour sits log m nats below the nearest.
+                span = float(scores[0] - scores[-1])
+                row_temps[i] = max(span / np.log(scores.size), MIN_BANDWIDTH)
+                rebandwidthed += 1
 
         centered = scores - scores.max()
         weights = np.exp(centered / float(row_temps[i]))
@@ -315,6 +339,8 @@ def _build_transition(
         row_scores.append(scores.astype(np.float32))
 
     stats = {
+        # After the loop, so a surviving-bandwidth build reports the temperatures
+        # it actually wrote into the rows.
         "row_temp_mean": float(row_temps.mean()),
         "row_temp_min": float(row_temps.min()),
         "row_temp_max": float(row_temps.max()),
@@ -322,8 +348,9 @@ def _build_transition(
         "degenerate_bandwidth_rows": int((row_temps <= MIN_BANDWIDTH).sum()),
         "held_out_edges": int(held_out_edges),
         "holdout_starved_rows": int(holdout_starved),
+        "rebandwidthed_rows": int(rebandwidthed),
     }
-    return row_neighbors, row_probs, row_scores, fallback_flags, stats
+    return row_neighbors, row_probs, row_scores, fallback_flags, row_temps, stats
 
 
 def _pad_rows(
@@ -425,6 +452,7 @@ _METADATA_KEYS = (
     "knn_mode",
     "holdout_edge_frac",
     "holdout_seed",
+    "holdout_bandwidth",
     "neighbor_source",
     "teacher_fingerprint",
 )
@@ -450,6 +478,7 @@ def build_or_load_ggpkd_artifact(
     knn_mode: str = "directed",
     holdout_edge_frac: float = 0.0,
     holdout_seed: int = 0,
+    holdout_bandwidth: str = "full",
     neighbor_source: str = "teacher",
     neighbor_embeddings: Callable[[], torch.Tensor] | None = None,
 ) -> dict:
@@ -469,6 +498,9 @@ def build_or_load_ggpkd_artifact(
         "knn_mode": str(knn_mode),
         "holdout_edge_frac": float(holdout_edge_frac),
         "holdout_seed": int(holdout_seed) if holdout_edge_frac > 0.0 else 0,
+        "holdout_bandwidth": (
+            str(holdout_bandwidth) if holdout_edge_frac > 0.0 else "full"
+        ),
         "neighbor_source": str(neighbor_source),
         "teacher_fingerprint": _fingerprint(teacher_embeddings),
     }
@@ -514,7 +546,7 @@ def build_or_load_ggpkd_artifact(
     if fixed_bandwidth:
         row_temps = np.full(n_items, float(np.median(row_temps)))
 
-    row_neighbors, row_probs, row_scores, fallback_flags, build_stats = (
+    row_neighbors, row_probs, row_scores, fallback_flags, row_temps, build_stats = (
         _build_transition(
             top_indices=top_indices,
             top_scores=top_scores,
@@ -523,6 +555,7 @@ def build_or_load_ggpkd_artifact(
             knn_mode=knn_mode,
             holdout_edge_frac=holdout_edge_frac,
             holdout_seed=holdout_seed,
+            holdout_bandwidth=holdout_bandwidth,
         )
     )
     neighbors, probs = _pad_rows(row_neighbors, row_probs)

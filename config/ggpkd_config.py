@@ -2,7 +2,12 @@ import math
 
 from src.criterions.ggpkd_distillation import ROW_COLUMNS, ROW_SETS, ROW_TARGETS
 from src.data_utils.batch_samplers import BATCH_SAMPLERS
-from src.ggpkd.graph_builder import KNN_MODES, NEIGHBOR_SOURCES
+from src.data_utils.ggpkd_dataset import POOL_SOURCES
+from src.ggpkd.graph_builder import (
+    HOLDOUT_BANDWIDTHS,
+    KNN_MODES,
+    NEIGHBOR_SOURCES,
+)
 
 from .base_config import BaseConfig
 
@@ -35,6 +40,10 @@ class GGPKDConfig(BaseConfig):
     # relations in Table 4. Independent of `seed`, so every arm withholds the same.
     holdout_edge_frac = 0.0
     holdout_seed = 12345
+    # Whether tau_j is read off the raw top-k ("full": a target-only holdout, the
+    # value story.md §6.4 says must be named as such) or off the edges the holdout
+    # left ("surviving": no withheld teacher score reaches training).
+    holdout_bandwidth = "full"
 
     # ---- Objective: L = row_weight * L_row + cal_weight * L_cal -------------------
     # AdamW is nearly scale-invariant, so only the ratio is a real knob (Table 6).
@@ -43,8 +52,12 @@ class GGPKDConfig(BaseConfig):
 
     # ---- Ablation switches ---------------------------------------------------
     row_set = "all"  # anchors / non_anchors: Tables 3-4
-    row_target = "teacher"  # uniform: Table 3 row 7
-    row_columns = "graph"  # random: Table 3 row 8
+    row_target = "teacher"  # uniform: Table 3 row 7; shuffled: Table 7
+    row_columns = "graph"  # random: Table 3 row 8; pool: Table 7 (dense control)
+    # graph: anchors plus their graph rows. random: the same number of texts drawn
+    # uniformly, which holds the pool's compute fixed and removes only its
+    # structure (Table 7).
+    pool_source = "graph"
     row_reweight = False  # 1/p_j row weights: Table 6
     batch_local = False  # pool = the batch, L_cal only: Table 3 rows 3-4
     batch_sampler = "random"  # neighbor: Table 3 rows 2 and 4
@@ -81,6 +94,8 @@ class GGPKDConfig(BaseConfig):
             ("row_target", self.row_target, ROW_TARGETS),
             ("row_columns", self.row_columns, ROW_COLUMNS),
             ("batch_sampler", self.batch_sampler, BATCH_SAMPLERS),
+            ("pool_source", self.pool_source, POOL_SOURCES),
+            ("holdout_bandwidth", self.holdout_bandwidth, HOLDOUT_BANDWIDTHS),
         ):
             if value not in choices:
                 raise ValueError(f"{name} must be one of {choices}, got {value!r}")
@@ -106,6 +121,11 @@ class GGPKDConfig(BaseConfig):
             or self.row_reweight
         )
         if self.batch_local:
+            if self.pool_source != "graph":
+                raise ValueError(
+                    "batch_local already fixes the pool to the batch; pool_source "
+                    "has nothing left to choose"
+                )
             if self.row_weight > 0 or row_switches:
                 raise ValueError(
                     "batch_local has no graph rows: it needs row_weight=0 and the "
@@ -121,10 +141,22 @@ class GGPKDConfig(BaseConfig):
             raise ValueError(
                 "the row switches only change L_row; row_weight must be > 0"
             )
-        if self.row_columns == "random" and self.holdout_edge_frac > 0:
+        if self.row_columns != "graph" and self.holdout_edge_frac > 0:
             raise ValueError(
-                "row_columns='random' could draw withheld pairs; run it without a holdout"
+                f"row_columns={self.row_columns!r} scores pairs the graph never "
+                "supervised and would draw withheld ones; run it without a holdout"
             )
+        if self.holdout_bandwidth == "surviving":
+            if self.holdout_edge_frac <= 0:
+                raise ValueError(
+                    "holdout_bandwidth='surviving' recomputes tau_j on the edges a "
+                    "holdout left; it needs holdout_edge_frac > 0"
+                )
+            if self.fixed_bandwidth:
+                raise ValueError(
+                    "holdout_bandwidth='surviving' is a per-row bandwidth; it "
+                    "cannot be combined with fixed_bandwidth"
+                )
         if self.row_reweight and (
             self.row_set == "anchors" or self.batch_sampler != "random"
         ):

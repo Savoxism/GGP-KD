@@ -17,6 +17,8 @@ TABLE_SCRIPTS = (
     "table4_loss_terms.sh",
     "table5_graph_k.sh",
     "table6_robustness.sh",
+    "table7_controls.sh",
+    "table8_budget.sh",
     "run_all.sh",
 )
 
@@ -60,6 +62,8 @@ def test_every_script_parses(script):
         "table3_exposure.sh",
         "table4_loss_terms.sh",
         "table6_robustness.sh",
+        "table7_controls.sh",
+        "table8_budget.sh",
     ],
 )
 def test_tables_after_table5_refuse_to_guess_graph_k(script):
@@ -182,3 +186,55 @@ def test_neighbor_batching_puts_more_neighbours_in_the_batch():
         > 3 * rows["random"]["in_batch_neighbors_per_row"]
     )
     assert rows["neighbor"]["n_batches"] == rows["random"]["n_batches"]
+
+
+def test_table7_plans_the_three_controls_on_one_graph():
+    result = _dry_run("table7_controls.sh", GRAPH_K="100")
+    assert result.returncode == 0, result.stderr
+    assert "graphs: 1" in result.stdout
+    for arm, flags in (
+        ("shuffled_target", "--row_target shuffled"),
+        ("random_pool", "--pool_source random"),
+        ("dense_rows", "--row_columns pool"),
+    ):
+        assert arm in result.stdout
+        assert flags in result.stdout
+
+
+def test_table8_is_a_one_seed_curve_whatever_the_profile():
+    """The budget curve buys points, not error bars: its 20-epoch arms cost four
+    ordinary runs each, so a paper-profile launch must not quietly triple it."""
+    result = _dry_run("table8_budget.sh", GRAPH_K="100", SEEDS="42,43,44")
+    assert result.returncode == 0, result.stderr
+    assert "seeds:  42\n" in result.stdout
+    assert "runs:   7" in result.stdout
+    for arm in ("ours_e5", "pointwise_e20", "in_batch_e20"):
+        assert arm in result.stdout
+
+
+def test_table8_honours_more_seeds_when_asked():
+    result = _dry_run(
+        "table8_budget.sh", GRAPH_K="100", SEEDS="42,43,44", BUDGET_SEEDS="42,43"
+    )
+    assert result.returncode == 0, result.stderr
+    assert "runs:   14" in result.stdout
+
+
+def test_table4_adds_the_strict_holdout_arm_on_its_own_graph():
+    """The withheld scores still set tau_j under the default, so the arm that
+    closes that path needs its own artifact -- and the same withheld pairs."""
+    result = _dry_run("table4_loss_terms.sh", GRAPH_K="100")
+    assert result.returncode == 0, result.stderr
+    assert "graphs: 2" in result.stdout
+    assert "holdout_strict" in result.stdout
+    assert "graph=main_holdout_strict" in result.stdout
+
+
+def test_run_all_includes_the_new_tables_in_order():
+    result = _dry_run("run_all.sh", GRAPH_K="100")
+    assert result.returncode == 0, result.stderr
+    order = [
+        result.stdout.index(f"Table {name} -- ")
+        for name in ("5", "3", "7", "4", "4h", "6", "1", "2", "8")
+    ]
+    assert order == sorted(order)

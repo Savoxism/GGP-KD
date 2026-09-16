@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# One command for the whole plan of story.md §5: preflight, Table 5, the graph_k
-# choice, then Tables 3, 4, 4h, 6, 1, 2 at that k. Runs detached, so an ssh drop
-# does not kill it.
+# One command for the whole plan: preflight, Table 5, the graph_k choice, then
+# Tables 3, 7, 4, 4h, 6, 1, 2, 8 at that k. Runs detached, so an ssh drop does not
+# kill it.
 #
 #   GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start               # pilot, 1 seed
 #   PROFILE=paper GPUS=4,5 JOBS_PER_GPU=2 bash scripts/exp/launch.sh start # 3 seeds
@@ -13,7 +13,7 @@
 #   SEEDS          overrides the profile
 #   GRAPH_K        skip the automatic choice (Table 5 then runs at that k only
 #                  if its results do not already hold it)
-#   FROM / TO      restrict the tables after the choice (3, 4, 4h, 6, 1, 2)
+#   FROM / TO      restrict the tables after the choice (3, 7, 4, 4h, 6, 1, 2, 8)
 #   TOLERANCE, MIN_LARGEST_FRAC   the selection rule (select_graph_k.py)
 #   GPUS, JOBS_PER_GPU, PAIRS, CACHE_ROOT, PYTHON_BIN   forwarded to the tables
 #   FOREGROUND=1   run the controller in this shell instead of detaching
@@ -26,7 +26,8 @@ cd "$REPO_ROOT"
 LAUNCH_ROOT="$REPO_ROOT/runs/launch"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv/bin/python}"
 TABLE5_PAIR="qwen3_0_6b_to_minilmv2_h384"
-RUNS_PER_SEED=28 # Table 5: 4, 3: 8, 4: 5, 6: 6, 1: 2, 2: 3
+RUNS_PER_SEED=33 # Table 5: 4, 3: 8, 7: 4, 4: 6, 6: 6, 1: 2, 2: 3
+BUDGET_RUNS=7    # Table 8 is a one-seed curve whatever the profile
 
 latest_run() {
     [[ -f "$LAUNCH_ROOT/latest" ]] || { echo "no launch has been started" >&2; exit 1; }
@@ -116,8 +117,11 @@ controller() {
         printf '%s\n' "$GRAPH_K" > "$RUN_DIR/graph_k"
         export GRAPH_K
     fi
-    phase "tables at graph_k=$GRAPH_K (FROM=${FROM:-5} TO=${TO:-2})"
-    FROM="${FROM:-5}" TO="${TO:-2}" bash "$SCRIPT_DIR/run_all.sh"
+    # TO defaults to the last table of run_all.sh's order, not to a literal: a
+    # table appended after it must not fall outside the default range.
+    local last_table="8"
+    phase "tables at graph_k=$GRAPH_K (FROM=${FROM:-5} TO=${TO:-$last_table})"
+    FROM="${FROM:-5}" TO="${TO:-$last_table}" bash "$SCRIPT_DIR/run_all.sh"
     phase "all tables done"
 }
 
@@ -156,7 +160,8 @@ cmd_start() {
     echo "commit:   $commit$dirty"
     echo "profile:  $profile (seeds $seeds)"
     echo "gpus:     $GPUS x ${JOBS_PER_GPU:-1} job(s)"
-    echo "runs:     ~$((RUNS_PER_SEED * n_seeds)) training runs (28 per seed)"
+    echo "runs:     ~$((RUNS_PER_SEED * n_seeds + BUDGET_RUNS)) training runs" \
+        "($RUNS_PER_SEED per seed, plus $BUDGET_RUNS one-seed budget-curve runs)"
     echo "log:      $RUN_DIR/controller.log"
     [[ -n "$dirty" ]] && echo "WARNING: the working tree has uncommitted changes"
 
