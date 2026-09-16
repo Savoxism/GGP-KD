@@ -20,11 +20,18 @@ import torch.nn.functional as F
 from torch import nn
 from torch.amp import GradScaler
 
-from distiller import KnowledgeDistiller
+from distiller import KnowledgeDistiller, training_batch_size
 from src.criterions.dual_space_kd import DualSpaceKD
 from src.methods import METHOD_NAMES, REGISTRY, get_method
 
 VOCAB, DIM, SEQ, BATCH = 40, 8, 5, 4
+
+
+def test_training_batch_size_supports_paired_and_ggpkd_batches():
+    assert training_batch_size({"input_ids1_stu": torch.zeros(3, 5)}) == 3
+    assert training_batch_size({"idx": torch.arange(7)}) == 7
+    with pytest.raises(KeyError, match="neither input_ids1_stu nor idx"):
+        training_batch_size({"pool_idx": torch.arange(9)})
 
 
 class _TinyEncoder(nn.Module):

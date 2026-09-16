@@ -51,6 +51,14 @@ from src.loss import info_nce
 from src.methods import get_method
 
 
+def training_batch_size(batch: dict) -> int:
+    """Return examples for paired batches and anchors for pool-based GGPKD batches."""
+    for key in ("input_ids1_stu", "idx"):
+        if key in batch:
+            return int(batch[key].size(0))
+    raise KeyError("training batch has neither input_ids1_stu nor idx")
+
+
 class KnowledgeDistiller:
     def __init__(self, config):
         self.config = config
@@ -640,7 +648,7 @@ class KnowledgeDistiller:
             if use_events:
                 end_event.record()
             self.global_step += 1
-            bs = batch["input_ids1_stu"].size(0)
+            bs = training_batch_size(batch)
             # Drains the stream, so both events have completed by the time the
             # elapsed time is read.
             loss_value = loss.item()
